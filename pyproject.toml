@@ -1,0 +1,30 @@
+[project]
+name = "dfs-nfl"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "duckdb>=1.5.5",
+    "nflreadpy>=0.1.5",
+    "pandas>=3.0.5",
+    "polars>=1.44.2",
+    "pyarrow>=25.0.1",
+    "scipy>=1.18.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dfs_nfl"]
+
+[tool.uv]
+package = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
