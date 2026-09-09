@@ -30,6 +30,7 @@ SOURCES = {
     "player_stats": lambda yr: nfl.load_player_stats([yr]),
     "team_stats": lambda yr: nfl.load_team_stats([yr]),
     "pbp": lambda yr: nfl.load_pbp([yr]).select(PBP_COLS),
+    "snap_counts": lambda yr: nfl.load_snap_counts([yr]),
 }
 
 
@@ -50,6 +51,13 @@ def ingest_schedules(first: int, last: int) -> None:
     print(f"  {out.relative_to(REPO_ROOT)}: {df.height:,} rows")
 
 
+def ingest_playerids() -> None:
+    out = RAW_DIR / "ff_playerids.parquet"
+    df = nfl.load_ff_playerids()
+    df.write_parquet(out)
+    print(f"  {out.relative_to(REPO_ROOT)}: {df.height:,} rows")
+
+
 def main() -> None:
     first = int(sys.argv[1]) if len(sys.argv) > 1 else 2016
     last = int(sys.argv[2]) if len(sys.argv) > 2 else 2025
@@ -58,6 +66,8 @@ def main() -> None:
         ingest_season(year)
     print("schedules")
     ingest_schedules(first, last)
+    print("playerids")
+    ingest_playerids()
 
 
 if __name__ == "__main__":

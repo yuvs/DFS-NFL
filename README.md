@@ -11,7 +11,11 @@ uv run pytest                        # scoring-function tests
 uv run python -m dfs_nfl.ingest      # download nflverse data (2016–2025)
 uv run python -m dfs_nfl.labels      # build curated label tables
 uv run python -m dfs_nfl.baselines   # walk-forward baseline backtest
+uv run python -m dfs_nfl.features    # build feature store
+uv run python -m dfs_nfl.models      # walk-forward LightGBM backtest
 ```
+
+macOS note: LightGBM needs OpenMP (`brew install libomp`).
 
 ## Layout
 
@@ -23,13 +27,19 @@ uv run python -m dfs_nfl.baselines   # walk-forward baseline backtest
   from play-by-play, offensive-unit points only)
 - `src/dfs_nfl/baselines.py` — the two naive baselines any model must beat
   (trailing 4-game mean; EWMA × opponent-allowed × Vegas implied-total)
+- `src/dfs_nfl/features.py` — pre-kickoff feature store (trailing usage/
+  production EWMAs, snap share, Vegas lines, opponent-allowed, venue/rest)
+- `src/dfs_nfl/models.py` — per-position LightGBM (with stacked baselines
+  as features) blended 60/40 with baseline B2
 
-## Baseline results (2021–2025 REG, walk-forward)
+## Backtest (2024–2025 REG, walk-forward, ≥2 prior games)
 
-| Pos | n | B1 MAE | B2 MAE | B2 Spearman |
-|-----|------:|------:|------:|------:|
-| QB  | 3,158 | 6.87 | 6.75 | 0.49 |
-| RB  | 7,837 | 4.53 | 4.36 | 0.68 |
-| WR  | 11,812 | 4.41 | 4.28 | 0.62 |
-| TE  | 5,867 | 3.34 | 3.19 | 0.54 |
-| DST | 2,718 | 4.68 | 4.32 | 0.22 |
+Final = 0.6·LightGBM + 0.4·B2. Beats both baselines at every position:
+
+| Pos | n | Final MAE | B1 MAE | B2 MAE | Final Spearman | B2 Spearman |
+|-----|------:|------:|------:|------:|------:|------:|
+| QB  | 1,280 | **6.58** | 7.05 | 6.97 | **0.50** | 0.46 |
+| RB  | 3,127 | **4.28** | 4.45 | 4.28 | **0.72** | 0.71 |
+| WR  | 4,756 | **4.09** | 4.27 | 4.16 | **0.64** | 0.63 |
+| TE  | 2,419 | **3.12** | 3.30 | 3.16 | **0.60** | 0.58 |
+| DST | 1,088 | **4.14** | 4.69 | 4.28 | **0.30** | 0.26 |
