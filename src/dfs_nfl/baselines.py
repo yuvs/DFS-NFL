@@ -181,8 +181,11 @@ def shrink_clamp(col: str) -> pl.Expr:
     return (1 + SHRINK * (pl.col(col).fill_null(1.0) - 1)).clip(lo, hi)
 
 
-def build_predictions() -> pl.DataFrame:
-    panel = add_trailing_predictions(load_panel())
+def build_predictions(panel: pl.DataFrame | None = None) -> pl.DataFrame:
+    """B1/B2 for every row of the panel. `panel` may include synthetic
+    future rows (null fd_points) — their trailing stats and factors come
+    out correct because everything is shift(1)/prior-week based."""
+    panel = add_trailing_predictions(load_panel() if panel is None else panel)
     panel = (
         panel
         .join(opponent_allowed_factor(panel),

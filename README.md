@@ -21,6 +21,29 @@ uv run python -m dfs_nfl.weather 2026 1  # kickoff weather forecasts
 
 macOS note: LightGBM needs OpenMP (`brew install libomp`).
 
+## Production (weekly)
+
+```sh
+uv run python -m dfs_nfl.weekly              # refresh -> scorecard -> project next week
+uv run python -m dfs_nfl.predict 2026 3      # project a specific week
+uv run python -m dfs_nfl.scorecard 2026 2    # score a completed week's projections
+```
+
+Projections land in `outputs/projections/{season}_w{week:02d}.csv` (one row
+per player/DST: projection, p10/p50/p90, implied total, confidence flag —
+`low` = cold-start prior for <2-game players). Scorecards append to
+`outputs/accuracy_log.csv`.
+
+Cron (times ET — Tue scorecard + early projections, Sun final pre-slate run):
+
+```cron
+0 9 * * 2 cd $HOME/DFS-NFL && $HOME/.local/bin/uv run python -m dfs_nfl.weekly >> outputs/weekly.log 2>&1
+0 10 * * 0 cd $HOME/DFS-NFL && $HOME/.local/bin/uv run python -m dfs_nfl.weekly >> outputs/weekly.log 2>&1
+```
+
+Optional: `export ODDS_API_KEY=...` (the-odds-api.com) for live line
+overrides via `dfs_nfl.odds`; without it, nflverse schedule lines are used.
+
 ## Layout
 
 - `src/dfs_nfl/scoring.py` — FanDuel scoring (2024+ rules incl. yardage
@@ -42,6 +65,10 @@ macOS note: LightGBM needs OpenMP (`brew install libomp`).
   by ~0.8–0.9 MAE
 - `src/dfs_nfl/odds.py` / `weather.py` — live-week Vegas lines (nflverse,
   The Odds API if `ODDS_API_KEY` set) and Open-Meteo kickoff forecasts
+- `src/dfs_nfl/predict.py` — production projections for an upcoming week
+  (synthetic feature rows from depth-chart universe + trailing history)
+- `src/dfs_nfl/scorecard.py` / `weekly.py` — accuracy tracking and the
+  single-command weekly orchestration
 
 ## Backtest (2024–2025 REG, walk-forward, ≥2 prior games)
 

@@ -160,11 +160,37 @@ def _with_opp_and_context(df: pl.DataFrame, panel_for_opp: pl.DataFrame) -> pl.D
     )
 
 
-def build_offense_features() -> pl.DataFrame:
+def _panel_with_skeleton(skeleton: pl.DataFrame | None) -> pl.DataFrame:
+    """Combined panel for opponent-allowed factors; skeleton rows (a not-
+    yet-played week, null fd_points) are appended so the factor table has
+    keys for that week, built from prior weeks only."""
+    panel = load_panel()
+    if skeleton is None:
+        return panel
+    return pl.concat(
+        [panel, skeleton.select("player_id", "position", "season", "week",
+                                "game_id", "team", "opponent_team")],
+        how="diagonal_relaxed",
+    )
+
+
+def build_offense_features(skeleton: pl.DataFrame | None = None) -> pl.DataFrame:
+    """Feature table for all history; pass `skeleton` (identity columns for
+    an upcoming week, stats null) to also get prediction-ready rows for
+    that week."""
+    pw = pl.read_parquet(CURATED_DIR / "player_week.parquet").filter(
+        pl.col("season_type") == "REG"
+    )
+    if skeleton is not None:
+        # simulate the target week as unplayed (matters when re-running a
+        # historical week): its real rows are replaced by the skeleton
+        pw = pl.concat(
+            [pw.join(skeleton.select("season", "week").unique(),
+                     on=["season", "week"], how="anti"), skeleton],
+            how="diagonal_relaxed",
+        )
     pw = (
-        pl.read_parquet(CURATED_DIR / "player_week.parquet")
-        .filter(pl.col("season_type") == "REG")
-        .join(snap_pct_table(), on=["season", "week", "player_id"], how="left")
+        pw.join(snap_pct_table(), on=["season", "week", "player_id"], how="left")
         .drop("position")
         .rename({"position_group": "position"})
         .sort(["player_id", "season", "week"])
@@ -182,14 +208,23 @@ def build_offense_features() -> pl.DataFrame:
         )
     )
     # opponent-allowed uses the combined panel so factors match baselines
-    return _with_opp_and_context(pw, load_panel()).sort(["season", "week", "team"])
+    return _with_opp_and_context(pw, _panel_with_skeleton(skeleton)).sort(
+        ["season", "week", "team"]
+    )
 
 
-def build_dst_features() -> pl.DataFrame:
+def build_dst_features(skeleton: pl.DataFrame | None = None) -> pl.DataFrame:
+    dst = pl.read_parquet(CURATED_DIR / "dst_week.parquet").filter(
+        pl.col("season_type") == "REG"
+    )
+    if skeleton is not None:
+        dst = pl.concat(
+            [dst.join(skeleton.select("season", "week").unique(),
+                      on=["season", "week"], how="anti"), skeleton],
+            how="diagonal_relaxed",
+        )
     dst = (
-        pl.read_parquet(CURATED_DIR / "dst_week.parquet")
-        .filter(pl.col("season_type") == "REG")
-        .with_columns(
+        dst.with_columns(
             pl.col("team").alias("player_id"),
             pl.lit("DST").alias("position"),
             (pl.col("def_interceptions").fill_null(0)
@@ -201,7 +236,9 @@ def build_dst_features() -> pl.DataFrame:
         )
     )
     dst = dst.with_columns(trailing_exprs(DST_TRAILING_COLS))
-    return _with_opp_and_context(dst, load_panel()).sort(["season", "week", "team"])
+    return _with_opp_and_context(dst, _panel_with_skeleton(skeleton)).sort(
+        ["season", "week", "team"]
+    )
 
 
 def main() -> None:

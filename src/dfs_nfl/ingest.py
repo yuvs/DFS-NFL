@@ -93,9 +93,13 @@ def ingest_season(year: int) -> None:
         print(f"  {out.relative_to(REPO_ROOT)}: {df.height:,} rows")
 
 
-def ingest_schedules(first: int, last: int) -> None:
+def ingest_schedules(first: int = 2016, last: int | None = None) -> None:
+    """All seasons from `first` on — no upper cap, so future seasons'
+    schedules (and their betting lines) arrive as soon as nflverse has them."""
     out = RAW_DIR / "schedules.parquet"
-    df = nfl.load_schedules().filter(pl.col("season").is_between(first, last))
+    df = nfl.load_schedules().filter(pl.col("season") >= first)
+    if last is not None:
+        df = df.filter(pl.col("season") <= last)
     df.write_parquet(out)
     print(f"  {out.relative_to(REPO_ROOT)}: {df.height:,} rows")
 
