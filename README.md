@@ -30,9 +30,10 @@ uv run python -m dfs_nfl.scorecard 2026 2    # score a completed week's projecti
 ```
 
 Projections land in `outputs/projections/{season}_w{week:02d}.csv` (one row
-per player/DST: projection, p10/p50/p90, implied total, confidence flag —
-`low` = cold-start prior for <2-game players). Scorecards append to
-`outputs/accuracy_log.csv`.
+per player/DST: projection, p10/p50/p90, `team_implied_total` /
+`opp_implied_total` — team-level Vegas context, shared by every player on
+the team — and a confidence flag, `low` = cold-start prior for <2-game
+players). Scorecards append to `outputs/accuracy_log.csv`.
 
 Cron (times ET — Tue scorecard + early projections, Sun final pre-slate run):
 

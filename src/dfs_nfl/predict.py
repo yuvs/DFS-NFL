@@ -313,7 +313,8 @@ def predict_week(season: int, week: int, refresh: bool = True) -> pl.DataFrame:
             "player_id", name_expr,
             pl.col("projection").round(2),
             "p10", "p50", "p90",
-            pl.col("implied_total").round(2),
+            pl.col("implied_total").round(2).alias("team_implied_total"),
+            pl.col("opp_implied_total").round(2),
             "prior_games",
             pl.when(pl.col("prior_games") < MIN_PRIOR_GAMES)
             .then(pl.lit("low")).otherwise(pl.lit("ok")).alias("confidence"),
