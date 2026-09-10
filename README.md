@@ -29,11 +29,27 @@ uv run python -m dfs_nfl.predict 2026 3      # project a specific week
 uv run python -m dfs_nfl.scorecard 2026 2    # score a completed week's projections
 ```
 
-Projections land in `outputs/projections/{season}_w{week:02d}.csv` (one row
-per player/DST: projection, p10/p50/p90, `team_implied_total` /
-`opp_implied_total` — team-level Vegas context, shared by every player on
-the team — and a confidence flag, `low` = cold-start prior for <2-game
-players). Scorecards append to `outputs/accuracy_log.csv`.
+Projections land in `outputs/projections/{season}_w{week:02d}.csv`, one row
+per player/DST. Columns:
+
+- `projection` — expected FanDuel points; `p10`/`p50`/`p90` — calibrated
+  floor / median / ceiling
+- `sd` — spread of outcomes in points, derived from the quantile band;
+  validated: realized error rises monotonically across sd quartiles
+- `cv` — volatility relative to projection. **The roster-construction
+  dial:** among players you like, low `cv` = stable (cash games /
+  must-not-bust slots), high `cv` = volatile (GPP leverage). Comparable
+  across salary tiers, unlike raw `sd`.
+- `skew` — tail asymmetry in [-1, 1]; positive = more room above the
+  median than below (boom/bust profile — the upside, when it hits, is
+  disproportionately large)
+- `team_implied_total` / `opp_implied_total` — team-level Vegas context,
+  shared by every player on the team
+- `confidence` — `low` = cold-start prior for <2-game players
+
+Optimizing for upside: sort by `p90` (or filter high `cv` + positive
+`skew`). Optimizing for stability: maximize `p10`, prefer low `cv`.
+Scorecards append to `outputs/accuracy_log.csv`.
 
 Cron (times ET — Tue scorecard + early projections, Sun final pre-slate run):
 

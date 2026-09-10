@@ -308,11 +308,29 @@ def predict_week(season: int, week: int, refresh: bool = True) -> pl.DataFrame:
             (pl.col("team") + " D/ST").alias("name") if pos == "DST"
             else pl.col("player_display_name").alias("name")
         )
+        # variance metrics derived from the calibrated quantiles:
+        #   sd   ~ (p90-p10)/2.563 (the 10th-90th pct span of a normal)
+        #   cv   = sd / projection — volatility relative to expectation;
+        #          low = stable (cash games), high = volatile (GPP)
+        #   skew = tail asymmetry in [-1, 1]; positive = more room above
+        #          the median than below (boom/bust profile)
+        width = pl.col("p90") - pl.col("p10")
+        variance_exprs = [
+            (width / 2.563).round(2).alias("sd"),
+            pl.when(pl.col("projection") >= 1.0)
+            .then(((width / 2.563) / pl.col("projection")).round(2))
+            .otherwise(None).alias("cv"),
+            pl.when(width > 0.5)
+            .then((((pl.col("p90") - pl.col("p50"))
+                    - (pl.col("p50") - pl.col("p10"))) / width).round(2))
+            .otherwise(None).alias("skew"),
+        ]
         out.append(preds.select(
             "season", "week", "game_id", "team", "opponent_team", "position",
             "player_id", name_expr,
             pl.col("projection").round(2),
             "p10", "p50", "p90",
+            *variance_exprs,
             pl.col("implied_total").round(2).alias("team_implied_total"),
             pl.col("opp_implied_total").round(2),
             "prior_games",
