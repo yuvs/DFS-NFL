@@ -6,6 +6,7 @@ dependencies = [
     "duckdb>=1.5.5",
     "lightgbm>=4.7.0",
     "nflreadpy>=0.1.5",
+    "ortools>=9.15.6755",
     "pandas>=3.0.5",
     "polars>=1.44.2",
     "pyarrow>=25.0.1",

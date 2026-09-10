@@ -66,6 +66,26 @@ slate player with salary, `value` (projected points per $1K) and
 indicator from the slate file. Filter out `O`/`IR`/`D` before building
 lineups; `Q` players carry extra risk the model can't see.
 
+## Lineup optimizer
+
+```sh
+uv run python -m dfs_nfl.optimizer 2026 1 --mode cash
+uv run python -m dfs_nfl.optimizer 2026 1 --mode gpp --n 5 --stack
+uv run python -m dfs_nfl.optimizer 2026 1 --lock "Josh Allen" --exclude "Chase Brown"
+```
+
+CP-SAT integer program over the value sheet. FanDuel classic rules are
+built in: 9 slots (QB/2RB/3WR/TE/FLEX/DST), $60K cap, max 4 per team,
+3+ teams. `--mode cash` maximizes 0.5·projection + 0.5·p10 and, by
+default, excludes Q-tagged and cold-start players (`--allow-risky` to
+override); `--mode gpp` maximizes 0.5·projection + 0.5·p90 (add
+`--stack` to force a QB + pass-catcher stack). O/IR/D players are always
+excluded, and lineups never roster offense against their own DST
+(`--allow-dst-conflict` to permit). `--n N --min-diff K` generates N
+lineups each differing by ≥K players. Lineup totals report a range of
+proj ± 1.28·√(Σsd²) — per-player p10/p90 don't sum. Output:
+`outputs/lineups/{season}_w{week:02d}_{mode}.csv`.
+
 Cron (times ET — Tue scorecard + early projections, Sun final pre-slate run):
 
 ```cron
