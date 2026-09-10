@@ -51,6 +51,21 @@ Optimizing for upside: sort by `p90` (or filter high `cv` + positive
 `skew`). Optimizing for stability: maximize `p10`, prefer low `cv`.
 Scorecards append to `outputs/accuracy_log.csv`.
 
+## Salary value sheets
+
+Drop FanDuel "players list" CSV exports (lobby → download players list)
+into `data/raw/fanduel/`, then:
+
+```sh
+uv run python -m dfs_nfl.value 2026 1   # match latest slate to projections
+```
+
+Writes `outputs/value/{season}_w{week:02d}_slate{id}.csv`: every matched
+slate player with salary, `value` (projected points per $1K) and
+`value_p90` (ceiling points per $1K — the GPP sort), plus the injury
+indicator from the slate file. Filter out `O`/`IR`/`D` before building
+lineups; `Q` players carry extra risk the model can't see.
+
 Cron (times ET — Tue scorecard + early projections, Sun final pre-slate run):
 
 ```cron

@@ -106,21 +106,20 @@ def snap_pct_table() -> pl.DataFrame:
     """(season, week, gsis player_id) -> offensive snap share."""
     files = sorted((RAW_DIR / "snap_counts").glob("*.parquet"))
     snaps = pl.concat([pl.read_parquet(f) for f in files], how="vertical_relaxed")
+    # sorts before unique / aggregation instead of unique's arbitrary
+    # tie-break, so repeated runs build identical features
     ids = (
         pl.read_parquet(RAW_DIR / "ff_playerids.parquet")
         .select("gsis_id", "pfr_id")
         .drop_nulls()
-        .unique(subset="pfr_id")
+        .sort("gsis_id")
+        .unique(subset="pfr_id", keep="first")
     )
     return (
         snaps.select("season", "week", "pfr_player_id", "offense_pct")
         .join(ids, left_on="pfr_player_id", right_on="pfr_id", how="inner")
-        .select(
-            "season", "week",
-            pl.col("gsis_id").alias("player_id"),
-            pl.col("offense_pct").cast(pl.Float64).alias("snap_pct"),
-        )
-        .unique(subset=["season", "week", "player_id"])
+        .group_by("season", "week", pl.col("gsis_id").alias("player_id"))
+        .agg(pl.col("offense_pct").cast(pl.Float64).max().alias("snap_pct"))
     )
 
 
@@ -147,7 +146,8 @@ def player_draft_table() -> pl.DataFrame:
             pl.col("draft_pick").fill_null(300).alias("draft_pick"),
         )
         .drop_nulls("player_id")
-        .unique(subset="player_id")
+        .sort("player_id", "rookie_season")
+        .unique(subset="player_id", keep="first")
     )
 
 

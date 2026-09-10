@@ -35,6 +35,10 @@ LGB_PARAMS = {
     "bagging_freq": 1,
     "verbose": -1,
     "seed": 7,
+    # bit-reproducible runs: same data -> same projections
+    "deterministic": True,
+    "force_row_wise": True,
+    "num_threads": 4,
 }
 # smaller samples (per-position row counts) want smaller trees
 POSITION_PARAMS = {
@@ -84,7 +88,11 @@ def to_matrix(df: pl.DataFrame, cols: list[str]) -> np.ndarray:
 
 
 def backtest_position(pos: str, baselines: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
-    df = load_features(pos).join(baselines, on=["player_id", "game_id"], how="left")
+    df = (
+        load_features(pos)
+        .join(baselines, on=["player_id", "game_id"], how="left")
+        .sort(["season", "week", "game_id", "player_id"])
+    )
     cols = feature_columns(df)
     params = LGB_PARAMS | POSITION_PARAMS.get(pos, {})
     eval_weeks = (

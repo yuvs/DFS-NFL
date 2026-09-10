@@ -103,10 +103,16 @@ def _depth_chart_universe(season: int, week: int) -> pl.DataFrame:
             usable = dc
         if usable.height:
             latest = usable["week"].max()
+            # one row per player: cuts/trades leave stale entries on
+            # multiple teams' charts, so tie-break deterministically by
+            # best depth rank (the team using him ranks him higher),
+            # then position/team alphabetically
             return (
                 usable.filter(pl.col("week") == latest)
                 .group_by(["team", "gsis_id", "position"])
                 .agg(pl.col("depth_rank").min())
+                .sort("gsis_id", "depth_rank", "position", "team")
+                .unique(subset="gsis_id", keep="first")
             )
     raise FileNotFoundError("no depth charts available for universe")
 
@@ -137,7 +143,17 @@ def offense_skeleton(season: int, week: int) -> pl.DataFrame:
         .join(games.select("team"), on="team", how="inner")
         .select("player_id", "team", "position")
     )
-    universe = pl.concat([dc, recent]).unique(subset="player_id", keep="first")
+    # depth-chart entry wins over recent-stats entry; sort makes the
+    # dedupe deterministic across runs
+    universe = (
+        pl.concat([
+            dc.with_columns(pl.lit(0, dtype=pl.Int8).alias("_src")),
+            recent.with_columns(pl.lit(1, dtype=pl.Int8).alias("_src")),
+        ])
+        .sort("player_id", "_src")
+        .unique(subset="player_id", keep="first")
+        .drop("_src")
+    )
     return (
         universe.join(games, on="team", how="inner")
         .join(players, on="player_id", how="left")
@@ -195,6 +211,9 @@ def _apply_weather(feats: pl.DataFrame, season: int, week: int) -> pl.DataFrame:
 
 
 def _train_and_predict(df: pl.DataFrame, pos: str, season: int, week: int) -> pl.DataFrame:
+    # fully-keyed sort: joins don't guarantee row order, and LightGBM's
+    # histogram building is order-sensitive even with deterministic=true
+    df = df.sort(["season", "week", "game_id", "player_id"])
     cols = feature_columns(df)
     params = LGB_PARAMS | POSITION_PARAMS.get(pos, {})
     # strictly-before filter keeps historical re-runs (scorecard testing)
@@ -242,7 +261,7 @@ def _cold_start_override(preds: pl.DataFrame, feats_off: pl.DataFrame,
                          season: int, week: int) -> pl.DataFrame:
     """Replace projections for <2-game offensive players with the pooled
     cold-start prior."""
-    pool = feats_off.with_columns(
+    pool = feats_off.sort(["season", "week", "game_id", "player_id"]).with_columns(
         pl.col("position").replace_strict(coldstart.POSITION_CODES,
                                           default=None).alias("position_code"),
         pl.col("draft_round").fill_null(8),

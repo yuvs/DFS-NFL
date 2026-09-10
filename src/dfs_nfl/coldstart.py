@@ -36,6 +36,9 @@ LGB_PARAMS = {
     "feature_fraction": 0.9,
     "verbose": -1,
     "seed": 7,
+    "deterministic": True,
+    "force_row_wise": True,
+    "num_threads": 4,
 }
 NUM_ROUNDS = 200
 
