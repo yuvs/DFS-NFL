@@ -31,7 +31,56 @@ SOURCES = {
     "team_stats": lambda yr: nfl.load_team_stats([yr]),
     "pbp": lambda yr: nfl.load_pbp([yr]).select(PBP_COLS),
     "snap_counts": lambda yr: nfl.load_snap_counts([yr]),
+    "depth_charts": lambda yr: load_depth_charts_normalized(yr),
 }
+
+
+def load_depth_charts_normalized(year: int) -> pl.DataFrame:
+    """Normalize both depth-chart schemas (weekly <=2024; timestamped
+    snapshots 2025+) to: season, week, team, gsis_id, position, depth_rank."""
+    dc = nfl.load_depth_charts([year])
+    if "depth_team" in dc.columns:  # old weekly schema
+        return (
+            dc.filter(pl.col("game_type") == "REG")
+            .select(
+                "season", "week",
+                pl.col("club_code").alias("team"),
+                "gsis_id", "position",
+                pl.col("depth_team").cast(pl.Int32, strict=False).alias("depth_rank"),
+            )
+            .drop_nulls(["gsis_id", "depth_rank"])
+            .group_by(["season", "week", "team", "gsis_id", "position"])
+            .agg(pl.col("depth_rank").min())
+        )
+    # new snapshot schema: assign each snapshot to the first schedule week
+    # whose latest game date is on/after the snapshot date
+    sched = (
+        nfl.load_schedules()
+        .filter((pl.col("season") == year) & (pl.col("game_type") == "REG"))
+        .group_by("week")
+        .agg(pl.col("gameday").max().alias("week_end"))
+        .sort("week")
+    )
+    weeks = sched.rows()  # [(week, week_end 'YYYY-MM-DD'), ...]
+    snap = dc.with_columns(pl.col("dt").cast(pl.Utf8).str.slice(0, 10).alias("snap_date"))
+    week_expr = pl.lit(None, dtype=pl.Int32)
+    for week, week_end in reversed(weeks):
+        week_expr = (
+            pl.when(pl.col("snap_date") <= week_end)
+            .then(pl.lit(week, dtype=pl.Int32))
+            .otherwise(week_expr)
+        )
+    return (
+        snap.with_columns(week_expr.alias("week"), pl.lit(year, dtype=pl.Int32).alias("season"))
+        .drop_nulls(["gsis_id", "week", "pos_rank"])
+        .select(
+            "season", "week", "team", "gsis_id",
+            pl.col("pos_abb").alias("position"),
+            pl.col("pos_rank").cast(pl.Int32, strict=False).alias("depth_rank"),
+        )
+        .group_by(["season", "week", "team", "gsis_id", "position"])
+        .agg(pl.col("depth_rank").min())
+    )
 
 
 def ingest_season(year: int) -> None:
@@ -58,6 +107,16 @@ def ingest_playerids() -> None:
     print(f"  {out.relative_to(REPO_ROOT)}: {df.height:,} rows")
 
 
+def ingest_players() -> None:
+    out = RAW_DIR / "players.parquet"
+    df = nfl.load_players().select(
+        "gsis_id", "display_name", "position", "birth_date",
+        "draft_year", "draft_round", "draft_pick", "rookie_season",
+    )
+    df.write_parquet(out)
+    print(f"  {out.relative_to(REPO_ROOT)}: {df.height:,} rows")
+
+
 def main() -> None:
     first = int(sys.argv[1]) if len(sys.argv) > 1 else 2016
     last = int(sys.argv[2]) if len(sys.argv) > 2 else 2025
@@ -68,6 +127,8 @@ def main() -> None:
     ingest_schedules(first, last)
     print("playerids")
     ingest_playerids()
+    print("players")
+    ingest_players()
 
 
 if __name__ == "__main__":

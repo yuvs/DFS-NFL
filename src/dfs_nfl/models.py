@@ -66,6 +66,7 @@ def feature_columns(df: pl.DataFrame) -> list[str]:
         "prior_games", "season_prior_games", "opp_factor_raw", "opp_allowed_pg",
         "is_home", "rest_days", "div_game", "is_dome", "total_line",
         "implied_total", "opp_implied_total", "vegas_edge", "week",
+        "temp", "wind", "depth_rank", "draft_round", "draft_pick", "is_rookie",
         # stacked baselines: built from strictly-prior games, so
         # pre-kickoff safe; gives the trees B2's multiplicative
         # ewma x opponent x Vegas structure directly

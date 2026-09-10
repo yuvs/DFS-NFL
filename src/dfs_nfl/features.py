@@ -69,18 +69,22 @@ def game_context() -> pl.DataFrame:
     base = sched.select(
         "game_id", "season", "week", "home_team", "away_team",
         "home_rest", "away_rest", "div_game", "roof", "spread_line",
-        "total_line",
+        "total_line", "temp", "wind",
     ).with_columns(
         (pl.col("total_line") / 2 + pl.col("spread_line") / 2).alias("home_implied"),
         (pl.col("total_line") / 2 - pl.col("spread_line") / 2).alias("away_implied"),
         pl.col("roof").is_in(["dome", "closed"]).cast(pl.Int8).alias("is_dome"),
+    ).with_columns(
+        # indoor games: standard conditions instead of nulls
+        pl.when(pl.col("is_dome") == 1).then(70).otherwise(pl.col("temp")).alias("temp"),
+        pl.when(pl.col("is_dome") == 1).then(0).otherwise(pl.col("wind")).alias("wind"),
     )
     home = base.select(
         "game_id",
         pl.col("home_team").alias("team"),
         pl.lit(1, dtype=pl.Int8).alias("is_home"),
         pl.col("home_rest").alias("rest_days"),
-        "div_game", "is_dome", "total_line",
+        "div_game", "is_dome", "total_line", "temp", "wind",
         pl.col("home_implied").alias("implied_total"),
         pl.col("away_implied").alias("opp_implied_total"),
     )
@@ -89,7 +93,7 @@ def game_context() -> pl.DataFrame:
         pl.col("away_team").alias("team"),
         pl.lit(0, dtype=pl.Int8).alias("is_home"),
         pl.col("away_rest").alias("rest_days"),
-        "div_game", "is_dome", "total_line",
+        "div_game", "is_dome", "total_line", "temp", "wind",
         pl.col("away_implied").alias("implied_total"),
         pl.col("home_implied").alias("opp_implied_total"),
     )
@@ -120,6 +124,33 @@ def snap_pct_table() -> pl.DataFrame:
     )
 
 
+def depth_rank_table() -> pl.DataFrame:
+    """(season, week, gsis player_id) -> depth-chart rank at own position."""
+    files = sorted((RAW_DIR / "depth_charts").glob("*.parquet"))
+    dc = pl.concat([pl.read_parquet(f) for f in files], how="vertical_relaxed")
+    return (
+        dc.filter(pl.col("position").is_in(["QB", "RB", "WR", "TE"]))
+        .group_by(["season", "week", "gsis_id"])
+        .agg(pl.col("depth_rank").min())
+        .rename({"gsis_id": "player_id"})
+    )
+
+
+def player_draft_table() -> pl.DataFrame:
+    """Static per-player draft capital and rookie-season info."""
+    return (
+        pl.read_parquet(RAW_DIR / "players.parquet")
+        .select(
+            pl.col("gsis_id").alias("player_id"),
+            "rookie_season", "draft_round",
+            # undrafted players sort after every drafted pick
+            pl.col("draft_pick").fill_null(300).alias("draft_pick"),
+        )
+        .drop_nulls("player_id")
+        .unique(subset="player_id")
+    )
+
+
 def _with_opp_and_context(df: pl.DataFrame, panel_for_opp: pl.DataFrame) -> pl.DataFrame:
     opp = opponent_allowed_factor(panel_for_opp)
     return (
@@ -141,7 +172,15 @@ def build_offense_features() -> pl.DataFrame:
             pl.int_range(pl.len()).over(["player_id", "season"]).alias("season_prior_games"),
         )
     )
-    pw = pw.with_columns(trailing_exprs(OFFENSE_TRAILING_COLS))
+    pw = (
+        pw.with_columns(trailing_exprs(OFFENSE_TRAILING_COLS))
+        .join(depth_rank_table(), on=["season", "week", "player_id"], how="left")
+        .join(player_draft_table(), on="player_id", how="left")
+        .with_columns(
+            (pl.col("season") == pl.col("rookie_season")).cast(pl.Int8)
+            .fill_null(0).alias("is_rookie"),
+        )
+    )
     # opponent-allowed uses the combined panel so factors match baselines
     return _with_opp_and_context(pw, load_panel()).sort(["season", "week", "team"])
 
