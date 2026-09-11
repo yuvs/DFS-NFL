@@ -43,6 +43,13 @@ def slate_id(path: Path) -> str:
     return m.group(1) if m else "slate"
 
 
+def slate_date(path: Path) -> str | None:
+    """Slate date encoded in FanDuel export filenames, e.g.
+    'FanDuel-NFL-2026 EDT-09 EDT-13 EDT-...' -> '2026-09-13'."""
+    m = re.search(r"FanDuel-NFL-(\d{4})\D+(\d{2})\D+(\d{2})", path.name)
+    return f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else None
+
+
 def name_key(col: str) -> pl.Expr:
     """Normalize a name for matching: lowercase alpha only, common
     suffixes stripped (jr/sr/ii-v)."""

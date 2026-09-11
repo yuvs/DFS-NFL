@@ -86,12 +86,25 @@ lineups each differing by ≥K players. Lineup totals report a range of
 proj ± 1.28·√(Σsd²) — per-player p10/p90 don't sum. Output:
 `outputs/lineups/{season}_w{week:02d}_{mode}.csv`.
 
-Cron (times ET — Tue scorecard + early projections, Sun final pre-slate run):
+`weekly` also auto-builds the value sheet and cash/GPP lineups when a
+FanDuel slate CSV for the target week is in `data/raw/fanduel/` (matched
+by the date in the export's filename). The only manual step each week is
+downloading that CSV from the FanDuel lobby.
 
-```cron
-0 9 * * 2 cd $HOME/DFS-NFL && $HOME/.local/bin/uv run python -m dfs_nfl.weekly >> outputs/weekly.log 2>&1
-0 10 * * 0 cd $HOME/DFS-NFL && $HOME/.local/bin/uv run python -m dfs_nfl.weekly >> outputs/weekly.log 2>&1
+Automation runs via launchd (survives sleep, unlike cron): agents
+`com.dfsnfl.weekly.tue` (Tue 9:00) and `com.dfsnfl.weekly.sun`
+(Sun 10:00, local time) run `dfs_nfl.weekly`, logging to
+`outputs/weekly.log`. Reference plists live in `deploy/launchd/`; to
+(re)install on a new machine:
+
+```sh
+cp deploy/launchd/*.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dfsnfl.weekly.tue.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dfsnfl.weekly.sun.plist
 ```
+
+(`launchctl bootout gui/$(id -u)/com.dfsnfl.weekly.tue` etc. to remove;
+`launchctl kickstart gui/$(id -u)/com.dfsnfl.weekly.sun` to run now.)
 
 Optional: `export ODDS_API_KEY=...` (the-odds-api.com) for live line
 overrides via `dfs_nfl.odds`; without it, nflverse schedule lines are used.
