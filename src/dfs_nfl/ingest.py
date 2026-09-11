@@ -32,6 +32,10 @@ SOURCES = {
     "pbp": lambda yr: nfl.load_pbp([yr]).select(PBP_COLS),
     "snap_counts": lambda yr: nfl.load_snap_counts([yr]),
     "depth_charts": lambda yr: load_depth_charts_normalized(yr),
+    "injuries": lambda yr: nfl.load_injuries([yr]).select(
+        "season", "game_type", "week", "team", "gsis_id", "position",
+        "report_status", "practice_status",
+    ),
 }
 
 

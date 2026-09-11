@@ -151,6 +151,100 @@ def player_draft_table() -> pl.DataFrame:
     )
 
 
+STATUS_ORD = {"Questionable": 1, "Doubtful": 2, "Out": 3}
+PRACTICE_ORD = {
+    "Full Participation in Practice": 0,
+    "Limited Participation in Practice": 1,
+    "Did Not Participate In Practice": 2,
+}
+
+
+def _read_injuries() -> pl.DataFrame:
+    files = sorted((RAW_DIR / "injuries").glob("*.parquet"))
+    if not files:
+        return pl.DataFrame(schema={"season": pl.Int32, "week": pl.Int32,
+                                    "team": pl.Utf8, "gsis_id": pl.Utf8,
+                                    "position": pl.Utf8, "report_status": pl.Utf8,
+                                    "practice_status": pl.Utf8})
+    return (
+        pl.concat([pl.read_parquet(f) for f in files], how="vertical_relaxed")
+        .filter(pl.col("game_type") == "REG")
+        .with_columns(
+            pl.col("season").cast(pl.Int32),
+            pl.col("week").cast(pl.Int32),
+        )
+    )
+
+
+def injury_status_table() -> pl.DataFrame:
+    """(season, week, player_id) -> own report/practice status, ordinal.
+    Reports finalize Friday before Sunday games, so they are
+    pre-kickoff-safe under the Sunday-morning snapshot rule."""
+    return (
+        _read_injuries()
+        .with_columns(
+            pl.col("report_status").replace_strict(STATUS_ORD, default=0)
+            .alias("inj_status"),
+            pl.col("practice_status").replace_strict(PRACTICE_ORD, default=0)
+            .alias("inj_practice"),
+        )
+        .group_by(["season", "week", pl.col("gsis_id").alias("player_id")])
+        .agg(pl.col("inj_status").max(), pl.col("inj_practice").max())
+    )
+
+
+def vacated_table() -> pl.DataFrame:
+    """Per (season, week, team, position): trailing FD points of teammates
+    ruled Out/Doubtful that week — the opportunity they vacate. Only
+    players who appeared within the last 5 schedule weeks count, so
+    long-absent names stop inflating the signal."""
+    played = (
+        pl.read_parquet(CURATED_DIR / "player_week.parquet")
+        .filter(pl.col("season_type") == "REG")
+        .sort("player_id", "season", "week")
+        .with_columns(
+            pl.col("fd_points").ewm_mean(half_life=EWMA_HALFLIFE)
+            .over("player_id").alias("fd_ewma_incl"),
+            # 25 > max week, so consecutive seasons stay ~contiguous and
+            # the recency gate below works across the offseason boundary
+            (pl.col("season") * 25 + pl.col("week")).cast(pl.Int64).alias("wk_idx"),
+        )
+        .select("player_id", "wk_idx", "fd_ewma_incl")
+        .sort("wk_idx")
+    )
+    out = (
+        _read_injuries()
+        .filter(pl.col("report_status").is_in(["Out", "Doubtful"])
+                & pl.col("position").is_in(["QB", "RB", "WR", "TE"]))
+        .select(
+            "season", "week", "team",
+            pl.col("position").alias("position_out"),
+            pl.col("gsis_id").alias("player_id"),
+            (pl.col("season") * 25 + pl.col("week") - 1).cast(pl.Int64)
+            .alias("asof_idx"),
+        )
+        .sort("asof_idx")
+    )
+    joined = out.join_asof(
+        played, left_on="asof_idx", right_on="wk_idx",
+        by="player_id", strategy="backward",
+    ).filter(
+        # active within ~10 schedule weeks; across the offseason boundary
+        # this admits players who produced late in the prior season
+        pl.col("fd_ewma_incl").is_not_null()
+        & ((pl.col("asof_idx") - pl.col("wk_idx")) <= 10)
+    )
+    per_pos = (
+        joined.group_by(["season", "week", "team", "position_out"])
+        .agg(pl.col("fd_ewma_incl").sum().round(2).alias("vacated_fd_pos"))
+    )
+    per_team = (
+        joined.group_by(["season", "week", "team"])
+        .agg(pl.col("fd_ewma_incl").sum().round(2).alias("vacated_fd_team"))
+    )
+    return per_pos, per_team
+
+
 def _with_opp_and_context(df: pl.DataFrame, panel_for_opp: pl.DataFrame) -> pl.DataFrame:
     opp = opponent_allowed_factor(panel_for_opp)
     return (
@@ -198,13 +292,22 @@ def build_offense_features(skeleton: pl.DataFrame | None = None) -> pl.DataFrame
             pl.int_range(pl.len()).over(["player_id", "season"]).alias("season_prior_games"),
         )
     )
+    vac_pos, vac_team = vacated_table()
     pw = (
         pw.with_columns(trailing_exprs(OFFENSE_TRAILING_COLS))
         .join(depth_rank_table(), on=["season", "week", "player_id"], how="left")
         .join(player_draft_table(), on="player_id", how="left")
+        .join(injury_status_table(), on=["season", "week", "player_id"], how="left")
+        .join(vac_pos.rename({"position_out": "position"}),
+              on=["season", "week", "team", "position"], how="left")
+        .join(vac_team, on=["season", "week", "team"], how="left")
         .with_columns(
             (pl.col("season") == pl.col("rookie_season")).cast(pl.Int8)
             .fill_null(0).alias("is_rookie"),
+            pl.col("inj_status").fill_null(0),
+            pl.col("inj_practice").fill_null(0),
+            pl.col("vacated_fd_pos").fill_null(0.0),
+            pl.col("vacated_fd_team").fill_null(0.0),
         )
     )
     # opponent-allowed uses the combined panel so factors match baselines

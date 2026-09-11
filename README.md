@@ -107,7 +107,9 @@ overrides via `dfs_nfl.odds`; without it, nflverse schedule lines are used.
 - `src/dfs_nfl/baselines.py` — the two naive baselines any model must beat
   (trailing 4-game mean; EWMA × opponent-allowed × Vegas implied-total)
 - `src/dfs_nfl/features.py` — pre-kickoff feature store (trailing usage/
-  production EWMAs, snap share, Vegas lines, opponent-allowed, venue/rest)
+  production EWMAs, snap share, Vegas lines, opponent-allowed, venue/rest,
+  weather, official injury report status/practice participation, and
+  vacated opportunity — trailing FD points of teammates ruled Out/Doubtful)
 - `src/dfs_nfl/models.py` — per-position LightGBM (with stacked baselines
   as features) blended 60/40 with baseline B2
 - `src/dfs_nfl/quantiles.py` — p10/p50/p90 quantile models (calibrated
