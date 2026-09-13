@@ -54,13 +54,19 @@ def build_slate_outputs(season: int, week: int) -> None:
         print(f"no slate CSV for {season} w{week} in {FANDUEL_DIR} — "
               "download the FanDuel players list to get value + lineups")
         return
+    from dfs_nfl.config import load_config
     from dfs_nfl.optimizer import generate, lineup_summary
 
     build_value_sheet(season, week, slate)
-    for mode, n, stack in (("cash", 1, False), ("gpp", 3, True)):
-        lineups = generate(season, week, mode, n, min_diff=2, locks=[],
-                           excludes=[], stack=stack, allow_dst_conflict=False,
-                           slate_path=None)
+    lu_cfg = load_config()["lineups"]
+    plans = (("cash", lu_cfg["cash"], False),
+             ("gpp", lu_cfg["gpp"], lu_cfg["gpp_stack"]))
+    for mode, n, stack in plans:
+        if n < 1:
+            continue
+        lineups = generate(season, week, mode, n, min_diff=lu_cfg["min_diff"],
+                           locks=[], excludes=[], stack=stack,
+                           allow_dst_conflict=False, slate_path=None)
         for i, lu in enumerate(lineups, 1):
             s = lineup_summary(lu)
             print(f"  {mode} lineup {i}: proj {s['projection']} "

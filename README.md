@@ -91,6 +91,11 @@ FanDuel slate CSV for the target week is in `data/raw/fanduel/` (matched
 by the date in the export's filename). The only manual step each week is
 downloading that CSV from the FanDuel lobby.
 
+How many lineups the automated run builds is set in `config.toml`
+(`[lineups]`: `cash`, `gpp`, `gpp_stack`, `min_diff`; set a count to 0 to
+skip that mode). Missing file or keys fall back to defaults, and ad-hoc
+`dfs_nfl.optimizer` runs use CLI flags instead.
+
 Automation runs via launchd (survives sleep, unlike cron): agents
 `com.dfsnfl.weekly.tue` (Tue 9:00) and `com.dfsnfl.weekly.sun`
 (Sun 10:00, local time) run `dfs_nfl.weekly`, logging to
