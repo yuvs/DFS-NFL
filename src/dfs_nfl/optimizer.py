@@ -217,6 +217,46 @@ def generate(season: int, week: int, mode: str, n: int, min_diff: int,
 
 SLOT_ORDER = {"QB": 0, "RB": 1, "WR": 2, "TE": 3, "DST": 5}
 
+UPLOAD_HEADER = ["QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "DEF"]
+
+
+def upload_row(lineup: pl.DataFrame) -> list[str]:
+    """One FanDuel bulk-upload row: slate player IDs in slot order.
+    The extra RB/WR/TE beyond the base counts fills FLEX."""
+    by_pos = {
+        pos: lineup.filter(pl.col("position") == pos)
+        .sort("salary", descending=True)["fanduel_id"].to_list()
+        for pos in ("QB", "RB", "WR", "TE", "DST")
+    }
+    flex = by_pos["RB"][2:] + by_pos["WR"][3:] + by_pos["TE"][1:]
+    return (by_pos["QB"][:1] + by_pos["RB"][:2] + by_pos["WR"][:3]
+            + by_pos["TE"][:1] + flex + by_pos["DST"][:1])
+
+
+def write_lineups(lineups: list[pl.DataFrame], season: int, week: int,
+                  mode: str) -> None:
+    """Readable CSV + FanDuel bulk-upload CSV for a lineup set."""
+    LINEUPS_DIR.mkdir(parents=True, exist_ok=True)
+    readable = [
+        lu.sort(pl.col("position").replace_strict(SLOT_ORDER), "salary",
+                descending=[False, True])
+        .drop("idx", "score", strict=False)
+        .with_columns(pl.lit(i).alias("lineup"))
+        for i, lu in enumerate(lineups, 1)
+    ]
+    pl.concat(readable).write_csv(
+        LINEUPS_DIR / f"{season}_w{week:02d}_{mode}.csv")
+    # plain text: the header repeats slot names (RB,RB,WR,WR,WR), which
+    # a DataFrame can't represent
+    upload_path = LINEUPS_DIR / f"{season}_w{week:02d}_{mode}_upload.csv"
+    with open(upload_path, "w") as f:
+        f.write(",".join(UPLOAD_HEADER) + "\n")
+        for lu in lineups:
+            row = upload_row(lu)
+            if len(row) != len(UPLOAD_HEADER) or any(not v for v in row):
+                raise ValueError(f"lineup missing slate IDs for upload: {row}")
+            f.write(",".join(row) + "\n")
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -241,7 +281,6 @@ def main() -> None:
     if not lineups:
         raise SystemExit("no feasible lineup — loosen constraints")
 
-    all_rows = []
     for i, lu in enumerate(lineups, 1):
         s = lineup_summary(lu)
         print(f"\nlineup {i} [{args.mode}]  salary ${s['salary']:,}  "
@@ -253,12 +292,10 @@ def main() -> None:
                  "projection", "p10", "p90", "cv", "injury")
         with pl.Config(tbl_rows=9, tbl_width_chars=140, tbl_hide_dataframe_shape=True):
             print(show)
-        all_rows.append(show.with_columns(pl.lit(i).alias("lineup")))
 
-    LINEUPS_DIR.mkdir(parents=True, exist_ok=True)
-    out = LINEUPS_DIR / f"{args.season}_w{args.week:02d}_{args.mode}.csv"
-    pl.concat(all_rows).write_csv(out)
-    print(f"\nwrote {out}")
+    write_lineups(lineups, args.season, args.week, args.mode)
+    stem = LINEUPS_DIR / f"{args.season}_w{args.week:02d}_{args.mode}"
+    print(f"\nwrote {stem}.csv and {stem}_upload.csv")
 
 
 if __name__ == "__main__":

@@ -83,8 +83,15 @@ override); `--mode gpp` maximizes 0.5·projection + 0.5·p90 (add
 excluded, and lineups never roster offense against their own DST
 (`--allow-dst-conflict` to permit). `--n N --min-diff K` generates N
 lineups each differing by ≥K players. Lineup totals report a range of
-proj ± 1.28·√(Σsd²) — per-player p10/p90 don't sum. Output:
-`outputs/lineups/{season}_w{week:02d}_{mode}.csv`.
+proj ± 1.28·√(Σsd²) — per-player p10/p90 don't sum.
+
+Each run writes two files per mode to `outputs/lineups/`:
+`{season}_w{week:02d}_{mode}.csv` (readable, one row per player) and
+`..._upload.csv` — FanDuel's bulk-entry format (slot header
+`QB,RB,RB,WR,WR,WR,TE,FLEX,DEF`, slate player IDs as cells). On the
+contest entry screen choose "Upload lineups from CSV" and hand it the
+upload file. IDs are slate-specific, so regenerate after downloading a
+new players list.
 
 `weekly` also auto-builds the value sheet and cash/GPP lineups when a
 FanDuel slate CSV for the target week is in `data/raw/fanduel/` (matched

@@ -55,7 +55,7 @@ def build_slate_outputs(season: int, week: int) -> None:
               "download the FanDuel players list to get value + lineups")
         return
     from dfs_nfl.config import load_config
-    from dfs_nfl.optimizer import generate, lineup_summary
+    from dfs_nfl.optimizer import generate, lineup_summary, write_lineups
 
     build_value_sheet(season, week, slate)
     lu_cfg = load_config()["lineups"]
@@ -72,16 +72,7 @@ def build_slate_outputs(season: int, week: int) -> None:
             print(f"  {mode} lineup {i}: proj {s['projection']} "
                   f"range {s['p10_total']}-{s['p90_total']} ${s['salary']:,}")
         if lineups:
-            import polars as _pl
-
-            from dfs_nfl.optimizer import LINEUPS_DIR, SLOT_ORDER
-
-            LINEUPS_DIR.mkdir(parents=True, exist_ok=True)
-            rows = [lu.sort(_pl.col("position").replace_strict(SLOT_ORDER))
-                    .with_columns(_pl.lit(i).alias("lineup"))
-                    for i, lu in enumerate(lineups, 1)]
-            _pl.concat(rows).drop("idx", "score").write_csv(
-                LINEUPS_DIR / f"{season}_w{week:02d}_{mode}.csv")
+            write_lineups(lineups, season, week, mode)
 
 
 def main() -> None:
