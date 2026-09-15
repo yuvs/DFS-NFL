@@ -3,6 +3,6 @@
 
 [lineups]
 cash = 1          # floor-weighted lineups (safe pool: no Q / cold-start)
-gpp = 3           # ceiling-weighted lineups
+gpp = 9           # ceiling-weighted lineups
 gpp_stack = true  # force QB + WR/TE teammate in GPP builds
 min_diff = 2      # each lineup differs from every prior one by >= this many players
