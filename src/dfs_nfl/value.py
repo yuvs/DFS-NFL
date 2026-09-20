@@ -64,6 +64,12 @@ def name_key(col: str) -> pl.Expr:
 
 def load_slate(path: Path) -> pl.DataFrame:
     raw = pl.read_csv(path)
+    # single-game exports price the MVP slot at 1.5x salary
+    mvp_salary = (
+        pl.col("MVP 1.5x Salary").cast(pl.Int64)
+        if "MVP 1.5x Salary" in raw.columns
+        else pl.lit(None, dtype=pl.Int64)
+    )
     return raw.select(
         pl.col("Id").alias("fanduel_id"),
         pl.when(pl.col("Position") == "D").then(pl.lit("DST"))
@@ -72,6 +78,7 @@ def load_slate(path: Path) -> pl.DataFrame:
         pl.col("Last Name").alias("last_name"),
         pl.col("Team").replace(TEAM_FIX).alias("team"),
         pl.col("Salary").cast(pl.Int64).alias("salary"),
+        mvp_salary.alias("mvp_salary"),
         pl.col("Injury Indicator").alias("injury"),
         pl.col("Roster Position").alias("roster_position"),
     )
@@ -115,7 +122,7 @@ def match_slate(slate: pl.DataFrame, proj: pl.DataFrame) -> tuple[pl.DataFrame, 
     matched3 = m3.filter(pl.col("projection").is_not_null())
     unmatched = m3.filter(pl.col("projection").is_null()).select(players.columns)
 
-    keep = ["fanduel_id", "fd_name", "position", "team", "salary", "injury",
+    keep = ["fanduel_id", "fd_name", "position", "team", "salary", "mvp_salary", "injury",
             "roster_position", "player_id", "name", "opponent_team",
             "projection", "p10", "p50", "p90", "sd", "cv", "skew",
             "team_implied_total", "opp_implied_total", "confidence"]

@@ -66,7 +66,8 @@ def build_slate_outputs(season: int, week: int) -> None:
             continue
         lineups = generate(season, week, mode, n, min_diff=lu_cfg["min_diff"],
                            locks=[], excludes=[], stack=stack,
-                           allow_dst_conflict=False, slate_path=None)
+                           allow_dst_conflict=False, slate_path=None,
+                           max_exposure=lu_cfg["max_exposure"])
         for i, lu in enumerate(lineups, 1):
             s = lineup_summary(lu)
             print(f"  {mode} lineup {i}: proj {s['projection']} "

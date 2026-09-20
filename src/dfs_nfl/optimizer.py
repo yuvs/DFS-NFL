@@ -6,6 +6,11 @@ FanDuel classic roster: QB, 2 RB, 3 WR, TE, FLEX (RB/WR/TE), DST;
 salary cap $60,000; max 4 players from one team; players from at least
 3 different teams.
 
+Single-game slates (auto-detected from the value sheet's MVP roster
+positions): 6 players — one MVP at 1.5x points and 1.5x salary plus
+5 AnyFLEX, same $60k cap, both teams represented. Stack and
+DST-conflict rules don't apply; outputs get a _single filename suffix.
+
 Modes (how the objective uses the calibrated quantiles):
   cash — floor-weighted:    maximize 0.5*projection + 0.5*p10
   gpp  — ceiling-weighted:  maximize 0.5*projection + 0.5*p90
@@ -50,6 +55,16 @@ MAX_PER_TEAM = 4
 MIN_TEAMS = 3
 OUT_TAGS = ["O", "IR", "D"]
 
+# FanDuel single-game: MVP (1.5x points, 1.5x salary) + 5 AnyFLEX,
+# same $60k cap, both teams must be represented
+SINGLE_GAME_SIZE = 6
+MVP_POINTS_MULT = 1.5
+
+
+def is_single_game(pool: pl.DataFrame) -> bool:
+    return ("roster_position" in pool.columns
+            and pool["roster_position"].str.contains("MVP").any())
+
 MODE_WEIGHTS = {"cash": ("p10", 0.5), "gpp": ("p90", 0.5), "mean": (None, 0.0)}
 
 
@@ -58,7 +73,9 @@ def load_pool(season: int, week: int, slate_path: Path | None,
     """safe_only additionally drops Q-tagged and cold-start players —
     the cash-mode default, since their floors are unknowable."""
     if slate_path is None:
-        candidates = sorted(VALUE_DIR.glob(f"{season}_w{week:02d}_slate*.csv"))
+        # newest sheet by mtime — slate IDs aren't chronological
+        candidates = sorted(VALUE_DIR.glob(f"{season}_w{week:02d}_slate*.csv"),
+                            key=lambda p: p.stat().st_mtime)
         if not candidates:
             raise FileNotFoundError(
                 f"no value sheet for {season} w{week} — run dfs_nfl.value first")
@@ -72,6 +89,11 @@ def load_pool(season: int, week: int, slate_path: Path | None,
         )
         .with_columns(pl.col("sd").fill_null(0.0))
     )
+    if "mvp_salary" in pool.columns:
+        pool = pool.with_columns(
+            pl.col("mvp_salary")
+            .fill_null((pl.col("salary") * 1.5).cast(pl.Int64))
+        )
     if safe_only:
         pool = pool.filter(
             (pl.col("injury").is_null() | (pl.col("injury") != "Q"))
@@ -96,9 +118,11 @@ def solve_lineup(
     allow_dst_conflict: bool = False,
     banned_sets: list[list[int]] | None = None,
     min_diff: int = 2,
+    banned_idx: set[int] | None = None,
 ) -> pl.DataFrame | None:
     """One optimal lineup, or None if infeasible. banned_sets are prior
-    lineups (row indices) that the new lineup must differ from."""
+    lineups (row indices) that the new lineup must differ from;
+    banned_idx are individual rows kept out (exposure caps)."""
     pool = pool.with_columns(_score_expr(mode).alias("score")).with_row_index("idx")
     rows = pool.to_dicts()
     model = cp_model.CpModel()
@@ -107,25 +131,42 @@ def solve_lineup(
     def rows_where(pred):
         return [r for r in rows if pred(r)]
 
-    model.add(sum(x.values()) == ROSTER_SIZE)
-    model.add(sum(r["salary"] * x[r["idx"]] for r in rows) <= SALARY_CAP)
-    for pos, (lo, hi) in SLOT_BOUNDS.items():
-        at_pos = [x[r["idx"]] for r in rows_where(lambda r, p=pos: r["position"] == p)]
-        model.add(sum(at_pos) >= lo)
-        model.add(sum(at_pos) <= hi)
-    flex_pool = [x[r["idx"]] for r in rows_where(lambda r: r["position"] in ("RB", "WR", "TE"))]
-    model.add(sum(flex_pool) == FLEX_POOL_SIZE)
-
+    single = is_single_game(pool)
+    roster_size = SINGLE_GAME_SIZE if single else ROSTER_SIZE
     teams = sorted({r["team"] for r in rows})
-    team_used = {}
-    for t in teams:
-        members = [x[r["idx"]] for r in rows_where(lambda r, t=t: r["team"] == t)]
-        model.add(sum(members) <= MAX_PER_TEAM)
-        used = model.new_bool_var(f"team_{t}")
-        model.add(sum(members) >= 1).only_enforce_if(used)
-        model.add(sum(members) == 0).only_enforce_if(used.negated())
-        team_used[t] = used
-    model.add(sum(team_used.values()) >= MIN_TEAMS)
+    mvp = None
+    if single:
+        # one MVP slot at 1.5x salary; every position is FLEX-eligible
+        mvp = {r["idx"]: model.new_bool_var(f"m{r['idx']}") for r in rows}
+        model.add(sum(x.values()) == SINGLE_GAME_SIZE)
+        model.add(sum(mvp.values()) == 1)
+        for i, m in mvp.items():
+            model.add(m <= x[i])
+        model.add(sum(r["salary"] * x[r["idx"]]
+                      + (r["mvp_salary"] - r["salary"]) * mvp[r["idx"]]
+                      for r in rows) <= SALARY_CAP)
+        for t in teams:  # both teams must be represented
+            members = [x[r["idx"]] for r in rows_where(lambda r, t=t: r["team"] == t)]
+            model.add(sum(members) >= 1)
+    else:
+        model.add(sum(x.values()) == ROSTER_SIZE)
+        model.add(sum(r["salary"] * x[r["idx"]] for r in rows) <= SALARY_CAP)
+        for pos, (lo, hi) in SLOT_BOUNDS.items():
+            at_pos = [x[r["idx"]] for r in rows_where(lambda r, p=pos: r["position"] == p)]
+            model.add(sum(at_pos) >= lo)
+            model.add(sum(at_pos) <= hi)
+        flex_pool = [x[r["idx"]] for r in rows_where(lambda r: r["position"] in ("RB", "WR", "TE"))]
+        model.add(sum(flex_pool) == FLEX_POOL_SIZE)
+
+        team_used = {}
+        for t in teams:
+            members = [x[r["idx"]] for r in rows_where(lambda r, t=t: r["team"] == t)]
+            model.add(sum(members) <= MAX_PER_TEAM)
+            used = model.new_bool_var(f"team_{t}")
+            model.add(sum(members) >= 1).only_enforce_if(used)
+            model.add(sum(members) == 0).only_enforce_if(used.negated())
+            team_used[t] = used
+        model.add(sum(team_used.values()) >= MIN_TEAMS)
 
     def match_names(names):
         idxs = []
@@ -142,14 +183,19 @@ def solve_lineup(
         model.add(x[i] == 1)
     for i in match_names(excludes):
         model.add(x[i] == 0)
+    for i in banned_idx or ():
+        if i in x:
+            model.add(x[i] == 0)
 
-    if stack:
+    if stack and not single:
         for qb in rows_where(lambda r: r["position"] == "QB"):
             mates = [x[r["idx"]] for r in rows_where(
                 lambda r, t=qb["team"]: r["team"] == t and r["position"] in ("WR", "TE"))]
             model.add(sum(mates) >= 1).only_enforce_if(x[qb["idx"]])
 
-    if not allow_dst_conflict:
+    # with only two teams a DST-conflict ban would force a one-sided
+    # lineup, so it only applies to classic slates
+    if not allow_dst_conflict and not single:
         for dst in rows_where(lambda r: r["position"] == "DST"):
             facing = [x[r["idx"]] for r in rows_where(
                 lambda r, opp=dst["opponent_team"]:
@@ -158,21 +204,37 @@ def solve_lineup(
                 model.add(sum(facing) == 0).only_enforce_if(x[dst["idx"]])
 
     for prev in banned_sets or []:
-        model.add(sum(x[i] for i in prev if i in x) <= ROSTER_SIZE - min_diff)
+        model.add(sum(x[i] for i in prev if i in x) <= roster_size - min_diff)
 
-    model.maximize(sum(round(r["score"] * 100) * x[r["idx"]] for r in rows))
+    obj = sum(round(r["score"] * 100) * x[r["idx"]] for r in rows)
+    if single:
+        obj += sum(round(r["score"] * 100 * (MVP_POINTS_MULT - 1)) * mvp[r["idx"]]
+                   for r in rows)
+    model.maximize(obj)
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 30
     solver.parameters.num_workers = 4
     solver.parameters.random_seed = 7
     if solver.solve(model) not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return None
-    return pool.filter(
+    out = pool.filter(
         pl.col("idx").is_in([r["idx"] for r in rows if solver.value(x[r["idx"]])])
     )
+    if single:
+        mvp_idx = next(i for i, m in mvp.items() if solver.value(m))
+        out = out.with_columns((pl.col("idx") == mvp_idx).alias("is_mvp"))
+    return out
 
 
 def validate_lineup(lineup: pl.DataFrame) -> None:
+    if "is_mvp" in lineup.columns:
+        assert lineup.height == SINGLE_GAME_SIZE, "wrong roster size"
+        assert lineup["is_mvp"].sum() == 1, "need exactly one MVP"
+        spend = sum(r["mvp_salary"] if r["is_mvp"] else r["salary"]
+                    for r in lineup.to_dicts())
+        assert spend <= SALARY_CAP, "over the cap"
+        assert lineup["team"].n_unique() == 2, "both teams required"
+        return
     assert lineup.height == ROSTER_SIZE, "wrong roster size"
     assert lineup["salary"].sum() <= SALARY_CAP, "over the cap"
     counts = dict(lineup.group_by("position").len().rows())
@@ -184,10 +246,16 @@ def validate_lineup(lineup: pl.DataFrame) -> None:
 
 
 def lineup_summary(lineup: pl.DataFrame) -> dict:
-    total_sd = float((lineup["sd"] ** 2).sum() ** 0.5)
-    proj = float(lineup["projection"].sum())
+    single = "is_mvp" in lineup.columns
+    rows = lineup.to_dicts()
+    mult = {True: MVP_POINTS_MULT, False: 1.0}
+    proj = sum(r["projection"] * mult[single and r["is_mvp"]] for r in rows)
+    total_sd = sum((r["sd"] * mult[single and r["is_mvp"]]) ** 2
+                   for r in rows) ** 0.5
+    salary = sum(r["mvp_salary"] if single and r["is_mvp"] else r["salary"]
+                 for r in rows)
     return {
-        "salary": int(lineup["salary"].sum()),
+        "salary": int(salary),
         "projection": round(proj, 1),
         "p10_total": round(proj - 1.2816 * total_sd, 1),
         "p90_total": round(proj + 1.2816 * total_sd, 1),
@@ -197,32 +265,60 @@ def lineup_summary(lineup: pl.DataFrame) -> dict:
 def generate(season: int, week: int, mode: str, n: int, min_diff: int,
              locks: list[str], excludes: list[str], stack: bool,
              allow_dst_conflict: bool, slate_path: Path | None,
-             allow_risky: bool = False) -> list[pl.DataFrame]:
+             allow_risky: bool = False,
+             max_exposure: float = 1.0) -> list[pl.DataFrame]:
+    """max_exposure caps how many of the n lineups any one player can
+    appear in (fraction, 1.0 = no cap; locked players are exempt).
+    Applied greedily: once a player hits the cap they're out of the
+    remaining builds, so later lineups project slightly lower."""
     # cash lineups are floor plays: Q-tagged and cold-start players are
     # out unless explicitly allowed (locks still work — lock = opt-in)
     safe_only = mode == "cash" and not allow_risky
     pool = load_pool(season, week, slate_path, safe_only=safe_only)
-    lineups, banned = [], []
+    if not 0 < max_exposure <= 1:
+        raise ValueError(f"max_exposure must be in (0, 1]: {max_exposure}")
+    cap = max(1, int(max_exposure * n + 1e-9))
+    lock_keys = {re.sub(r"[^a-z]", "", name.lower()) for name in locks}
+    lineups, banned, capped = [], [], set()
+    appearances: dict[int, int] = {}
     for _ in range(n):
         lu = solve_lineup(pool, mode=mode, locks=locks, excludes=excludes,
                           stack=stack, allow_dst_conflict=allow_dst_conflict,
-                          banned_sets=banned, min_diff=min_diff)
+                          banned_sets=banned, min_diff=min_diff,
+                          banned_idx=capped)
         if lu is None:
             break
         validate_lineup(lu)
         lineups.append(lu)
         banned.append(lu["idx"].to_list())
+        for idx, name in zip(lu["idx"], lu["fd_name"]):
+            appearances[idx] = appearances.get(idx, 0) + 1
+            locked = re.sub(r"[^a-z]", "", name.lower()) in lock_keys
+            if appearances[idx] >= cap and not locked:
+                capped.add(idx)
     return lineups
 
 
-SLOT_ORDER = {"QB": 0, "RB": 1, "WR": 2, "TE": 3, "DST": 5}
+SLOT_ORDER = {"QB": 0, "RB": 1, "WR": 2, "TE": 3, "K": 4, "DST": 5}
 
 UPLOAD_HEADER = ["QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "DEF"]
+SINGLE_UPLOAD_HEADER = ["MVP - 1.5X Points",
+                        "AnyFLEX", "AnyFLEX", "AnyFLEX", "AnyFLEX", "AnyFLEX"]
+
+
+def lineup_display_sort(lineup: pl.DataFrame) -> pl.DataFrame:
+    """MVP first for single-game; slot order then salary for classic."""
+    if "is_mvp" in lineup.columns:
+        return lineup.sort(["is_mvp", "salary"], descending=[True, True])
+    return lineup.sort(pl.col("position").replace_strict(SLOT_ORDER), "salary",
+                       descending=[False, True])
 
 
 def upload_row(lineup: pl.DataFrame) -> list[str]:
     """One FanDuel bulk-upload row: slate player IDs in slot order.
     The extra RB/WR/TE beyond the base counts fills FLEX."""
+    if "is_mvp" in lineup.columns:
+        return lineup_display_sort(lineup)["fanduel_id"].to_list()
     by_pos = {
         pos: lineup.filter(pl.col("position") == pos)
         .sort("salary", descending=True)["fanduel_id"].to_list()
@@ -237,23 +333,24 @@ def write_lineups(lineups: list[pl.DataFrame], season: int, week: int,
                   mode: str) -> None:
     """Readable CSV + FanDuel bulk-upload CSV for a lineup set."""
     LINEUPS_DIR.mkdir(parents=True, exist_ok=True)
+    single = bool(lineups) and "is_mvp" in lineups[0].columns
+    stem = f"{season}_w{week:02d}_{mode}" + ("_single" if single else "")
     readable = [
-        lu.sort(pl.col("position").replace_strict(SLOT_ORDER), "salary",
-                descending=[False, True])
+        lineup_display_sort(lu)
         .drop("idx", "score", strict=False)
         .with_columns(pl.lit(i).alias("lineup"))
         for i, lu in enumerate(lineups, 1)
     ]
-    pl.concat(readable).write_csv(
-        LINEUPS_DIR / f"{season}_w{week:02d}_{mode}.csv")
+    pl.concat(readable).write_csv(LINEUPS_DIR / f"{stem}.csv")
     # plain text: the header repeats slot names (RB,RB,WR,WR,WR), which
     # a DataFrame can't represent
-    upload_path = LINEUPS_DIR / f"{season}_w{week:02d}_{mode}_upload.csv"
+    header = SINGLE_UPLOAD_HEADER if single else UPLOAD_HEADER
+    upload_path = LINEUPS_DIR / f"{stem}_upload.csv"
     with open(upload_path, "w") as f:
-        f.write(",".join(UPLOAD_HEADER) + "\n")
+        f.write(",".join(header) + "\n")
         for lu in lineups:
             row = upload_row(lu)
-            if len(row) != len(UPLOAD_HEADER) or any(not v for v in row):
+            if len(row) != len(header) or any(not v for v in row):
                 raise ValueError(f"lineup missing slate IDs for upload: {row}")
             f.write(",".join(row) + "\n")
 
@@ -272,12 +369,16 @@ def main() -> None:
     ap.add_argument("--allow-risky", action="store_true",
                     help="let cash mode roster Q-tagged / cold-start players")
     ap.add_argument("--slate", type=Path, default=None)
+    ap.add_argument("--max-exposure", type=float, default=1.0,
+                    help="max share of the N lineups any player may appear in "
+                         "(e.g. 0.5); locked players are exempt")
     args = ap.parse_args()
 
     lineups = generate(args.season, args.week, args.mode, args.n, args.min_diff,
                        args.lock, args.exclude, args.stack,
                        args.allow_dst_conflict, args.slate,
-                       allow_risky=args.allow_risky)
+                       allow_risky=args.allow_risky,
+                       max_exposure=args.max_exposure)
     if not lineups:
         raise SystemExit("no feasible lineup — loosen constraints")
 
@@ -285,16 +386,17 @@ def main() -> None:
         s = lineup_summary(lu)
         print(f"\nlineup {i} [{args.mode}]  salary ${s['salary']:,}  "
               f"proj {s['projection']}  range {s['p10_total']}-{s['p90_total']}")
-        show = lu.sort(
-            pl.col("position").replace_strict(SLOT_ORDER), "salary",
-            descending=[False, True],
-        ).select("position", "fd_name", "team", "opponent_team", "salary",
-                 "projection", "p10", "p90", "cv", "injury")
+        cols = ["position", "fd_name", "team", "opponent_team", "salary",
+                "projection", "p10", "p90", "cv", "injury"]
+        if "is_mvp" in lu.columns:
+            cols.insert(0, "is_mvp")
+        show = lineup_display_sort(lu).select(cols)
         with pl.Config(tbl_rows=9, tbl_width_chars=140, tbl_hide_dataframe_shape=True):
             print(show)
 
     write_lineups(lineups, args.season, args.week, args.mode)
-    stem = LINEUPS_DIR / f"{args.season}_w{args.week:02d}_{args.mode}"
+    suffix = "_single" if "is_mvp" in lineups[0].columns else ""
+    stem = LINEUPS_DIR / f"{args.season}_w{args.week:02d}_{args.mode}{suffix}"
     print(f"\nwrote {stem}.csv and {stem}_upload.csv")
 
 

@@ -88,3 +88,30 @@ def test_injured_players_filtered(tmp_path):
     filtered = pool.filter(
         pl.col("injury").is_null() | ~pl.col("injury").is_in(optimizer.OUT_TAGS))
     assert "AAA QB0" not in filtered["fd_name"].to_list()
+
+
+def test_max_exposure_caps_appearances(monkeypatch):
+    pool = synthetic_pool()
+    monkeypatch.setattr(optimizer, "load_pool", lambda *a, **k: pool)
+    n = 4
+    lineups = optimizer.generate(2026, 1, "gpp", n, min_diff=1, locks=[],
+                                 excludes=[], stack=False,
+                                 allow_dst_conflict=False, slate_path=None,
+                                 max_exposure=0.5)
+    assert len(lineups) == n
+    counts: dict[str, int] = {}
+    for lu in lineups:
+        for name in lu["fd_name"]:
+            counts[name] = counts.get(name, 0) + 1
+    assert max(counts.values()) <= 2
+
+
+def test_max_exposure_exempts_locks(monkeypatch):
+    pool = synthetic_pool()
+    monkeypatch.setattr(optimizer, "load_pool", lambda *a, **k: pool)
+    lineups = optimizer.generate(2026, 1, "gpp", 3, min_diff=1,
+                                 locks=["AAA QB0"], excludes=[], stack=False,
+                                 allow_dst_conflict=False, slate_path=None,
+                                 max_exposure=0.34)
+    assert len(lineups) == 3
+    assert all("AAA QB0" in lu["fd_name"].to_list() for lu in lineups)

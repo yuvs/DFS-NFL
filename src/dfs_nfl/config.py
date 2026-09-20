@@ -10,7 +10,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = REPO_ROOT / "config.toml"
 
 DEFAULTS = {
-    "lineups": {"cash": 1, "gpp": 3, "gpp_stack": True, "min_diff": 2},
+    "lineups": {"cash": 1, "gpp": 3, "gpp_stack": True, "min_diff": 2,
+                "max_exposure": 1.0},
 }
 
 

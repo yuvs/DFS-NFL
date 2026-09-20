@@ -82,7 +82,8 @@ override); `--mode gpp` maximizes 0.5·projection + 0.5·p90 (add
 `--stack` to force a QB + pass-catcher stack). O/IR/D players are always
 excluded, and lineups never roster offense against their own DST
 (`--allow-dst-conflict` to permit). `--n N --min-diff K` generates N
-lineups each differing by ≥K players. Lineup totals report a range of
+lineups each differing by ≥K players. `--max-exposure 0.5` keeps any one
+player out of more than half the lineups (locked players exempt). Lineup totals report a range of
 proj ± 1.28·√(Σsd²) — per-player p10/p90 don't sum.
 
 Each run writes two files per mode to `outputs/lineups/`:
@@ -99,8 +100,8 @@ by the date in the export's filename). The only manual step each week is
 downloading that CSV from the FanDuel lobby.
 
 How many lineups the automated run builds is set in `config.toml`
-(`[lineups]`: `cash`, `gpp`, `gpp_stack`, `min_diff`; set a count to 0 to
-skip that mode). Missing file or keys fall back to defaults, and ad-hoc
+(`[lineups]`: `cash`, `gpp`, `gpp_stack`, `min_diff`, `max_exposure`; set a
+count to 0 to skip that mode). Missing file or keys fall back to defaults, and ad-hoc
 `dfs_nfl.optimizer` runs use CLI flags instead.
 
 Automation runs via launchd (survives sleep, unlike cron): agents
