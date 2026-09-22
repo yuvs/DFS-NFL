@@ -131,6 +131,10 @@ def match_slate(slate: pl.DataFrame, proj: pl.DataFrame) -> tuple[pl.DataFrame, 
     return pl.concat(parts, how="diagonal_relaxed"), unmatched
 
 
+def value_sheet_path(season: int, week: int, slate_path: Path) -> Path:
+    return VALUE_DIR / f"{season}_w{week:02d}_slate{slate_id(slate_path)}.csv"
+
+
 def build_value_sheet(season: int, week: int, slate_path: Path | None = None) -> pl.DataFrame:
     slate_path = slate_path or latest_slate_file()
     proj_path = PROJECTIONS_DIR / f"{season}_w{week:02d}.parquet"
@@ -149,7 +153,7 @@ def build_value_sheet(season: int, week: int, slate_path: Path | None = None) ->
         .sort("value", descending=True)
     )
     VALUE_DIR.mkdir(parents=True, exist_ok=True)
-    out = VALUE_DIR / f"{season}_w{week:02d}_slate{slate_id(slate_path)}.csv"
+    out = value_sheet_path(season, week, slate_path)
     sheet.write_csv(out)
     print(f"wrote {out} ({sheet.height} of {slate.height} slate players matched)")
 
@@ -168,10 +172,10 @@ def main() -> None:
     sheet = build_value_sheet(season, week, path)
     # null injury = healthy; is_in on null would be null and drop them
     playable = sheet.filter(
-        pl.col("injury").is_null() | ~pl.col("injury").is_in(["O", "IR", "D"])
+        pl.col("injury").is_null() | ~pl.col("injury").is_in(["O", "IR", "D", "NA"])
     )
     with pl.Config(tbl_rows=15, tbl_width_chars=160):
-        print("\ntop value (projected pts per $1K, excluding O/IR/D):")
+        print("\ntop value (projected pts per $1K, excluding O/IR/D/NA):")
         print(playable.select("fd_name", "position", "team", "salary",
                               "projection", "value", "cv", "injury").head(15))
 

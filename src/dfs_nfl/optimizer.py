@@ -6,10 +6,14 @@ FanDuel classic roster: QB, 2 RB, 3 WR, TE, FLEX (RB/WR/TE), DST;
 salary cap $60,000; max 4 players from one team; players from at least
 3 different teams.
 
-Single-game slates (auto-detected from the value sheet's MVP roster
-positions): 6 players — one MVP at 1.5x points and 1.5x salary plus
-5 AnyFLEX, same $60k cap, both teams represented. Stack and
-DST-conflict rules don't apply; outputs get a _single filename suffix.
+Tournament (FanDuel single-game) format: 6 players — one MVP at 1.5x
+points and 1.5x salary plus 5 FLEX of any position, same $60k cap, both
+teams represented. Built from a single-game players-list export (that's
+where the MVP salaries and slate IDs come from) and auto-detected from
+its MVP roster positions; --format tournament|classic asserts the
+expected format instead of trusting detection. Stack and DST-conflict
+rules don't apply. Outputs get a _tournament_{AWAY-HOME} suffix so
+Thursday and Monday builds in the same week don't overwrite each other.
 
 Modes (how the objective uses the calibrated quantiles):
   cash — floor-weighted:    maximize 0.5*projection + 0.5*p10
@@ -31,6 +35,11 @@ Usage:
     --stack                require a WR/TE teammate with your QB (GPP staple)
     --allow-dst-conflict   permit offensive players facing your own DST
     --slate PATH           value-sheet CSV (default: newest for the week)
+    --format auto|classic|tournament
+                           roster format; auto (default) detects it from
+                           the value sheet, the others fail loudly on a
+                           mismatch
+    --max-exposure F       max share of the N lineups any player may be in
 """
 
 from __future__ import annotations
@@ -53,17 +62,38 @@ SLOT_BOUNDS = {"QB": (1, 1), "RB": (2, 3), "WR": (3, 4), "TE": (1, 2), "DST": (1
 FLEX_POOL_SIZE = 7  # RB + WR + TE including the FLEX
 MAX_PER_TEAM = 4
 MIN_TEAMS = 3
-OUT_TAGS = ["O", "IR", "D"]
+# FanDuel injury indicators that mean the player will not play
+# (NA = "Not Active": declared inactive / coach's decision)
+OUT_TAGS = ["O", "IR", "D", "NA"]
 
-# FanDuel single-game: MVP (1.5x points, 1.5x salary) + 5 AnyFLEX,
-# same $60k cap, both teams must be represented
-SINGLE_GAME_SIZE = 6
+# FanDuel tournament / single-game: MVP (1.5x points, 1.5x salary) +
+# 5 FLEX of any position, same $60k cap, both teams must be represented
+TOURNAMENT_SIZE = 6
 MVP_POINTS_MULT = 1.5
 
+FORMATS = ("auto", "classic", "tournament")
 
-def is_single_game(pool: pl.DataFrame) -> bool:
+
+def is_tournament(pool: pl.DataFrame) -> bool:
+    """Single-game exports list an MVP roster position; classic ones don't."""
     return ("roster_position" in pool.columns
             and pool["roster_position"].str.contains("MVP").any())
+
+
+def resolve_format(pool: pl.DataFrame, fmt: str = "auto") -> str:
+    """'classic' or 'tournament' for this pool; raises if a requested
+    format doesn't match what the value sheet supports."""
+    if fmt not in FORMATS:
+        raise ValueError(f"format must be one of {FORMATS}: {fmt!r}")
+    detected = "tournament" if is_tournament(pool) else "classic"
+    if fmt != "auto" and fmt != detected:
+        hint = ("download the single-game players list from the FanDuel "
+                "lobby — MVP salaries and slate IDs come from that export"
+                if fmt == "tournament" else
+                "this is a single-game export; classic needs the full-slate list")
+        raise ValueError(f"value sheet is {detected}, not {fmt}: {hint}")
+    return detected
+
 
 MODE_WEIGHTS = {"cash": ("p10", 0.5), "gpp": ("p90", 0.5), "mean": (None, 0.0)}
 
@@ -131,14 +161,14 @@ def solve_lineup(
     def rows_where(pred):
         return [r for r in rows if pred(r)]
 
-    single = is_single_game(pool)
-    roster_size = SINGLE_GAME_SIZE if single else ROSTER_SIZE
+    single = is_tournament(pool)
+    roster_size = TOURNAMENT_SIZE if single else ROSTER_SIZE
     teams = sorted({r["team"] for r in rows})
     mvp = None
     if single:
         # one MVP slot at 1.5x salary; every position is FLEX-eligible
         mvp = {r["idx"]: model.new_bool_var(f"m{r['idx']}") for r in rows}
-        model.add(sum(x.values()) == SINGLE_GAME_SIZE)
+        model.add(sum(x.values()) == TOURNAMENT_SIZE)
         model.add(sum(mvp.values()) == 1)
         for i, m in mvp.items():
             model.add(m <= x[i])
@@ -228,7 +258,7 @@ def solve_lineup(
 
 def validate_lineup(lineup: pl.DataFrame) -> None:
     if "is_mvp" in lineup.columns:
-        assert lineup.height == SINGLE_GAME_SIZE, "wrong roster size"
+        assert lineup.height == TOURNAMENT_SIZE, "wrong roster size"
         assert lineup["is_mvp"].sum() == 1, "need exactly one MVP"
         spend = sum(r["mvp_salary"] if r["is_mvp"] else r["salary"]
                     for r in lineup.to_dicts())
@@ -266,15 +296,19 @@ def generate(season: int, week: int, mode: str, n: int, min_diff: int,
              locks: list[str], excludes: list[str], stack: bool,
              allow_dst_conflict: bool, slate_path: Path | None,
              allow_risky: bool = False,
-             max_exposure: float = 1.0) -> list[pl.DataFrame]:
+             max_exposure: float = 1.0,
+             fmt: str = "auto") -> list[pl.DataFrame]:
     """max_exposure caps how many of the n lineups any one player can
     appear in (fraction, 1.0 = no cap; locked players are exempt).
     Applied greedily: once a player hits the cap they're out of the
-    remaining builds, so later lineups project slightly lower."""
+    remaining builds, so later lineups project slightly lower.
+    fmt: 'auto' builds whatever format the value sheet supports;
+    'classic' / 'tournament' raise if the sheet is the other kind."""
     # cash lineups are floor plays: Q-tagged and cold-start players are
     # out unless explicitly allowed (locks still work — lock = opt-in)
     safe_only = mode == "cash" and not allow_risky
     pool = load_pool(season, week, slate_path, safe_only=safe_only)
+    resolve_format(pool, fmt)
     if not 0 < max_exposure <= 1:
         raise ValueError(f"max_exposure must be in (0, 1]: {max_exposure}")
     cap = max(1, int(max_exposure * n + 1e-9))
@@ -302,12 +336,12 @@ def generate(season: int, week: int, mode: str, n: int, min_diff: int,
 SLOT_ORDER = {"QB": 0, "RB": 1, "WR": 2, "TE": 3, "K": 4, "DST": 5}
 
 UPLOAD_HEADER = ["QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "DEF"]
-SINGLE_UPLOAD_HEADER = ["MVP - 1.5X Points",
-                        "AnyFLEX", "AnyFLEX", "AnyFLEX", "AnyFLEX", "AnyFLEX"]
+TOURNAMENT_UPLOAD_HEADER = ["MVP - 1.5X Points",
+                            "AnyFLEX", "AnyFLEX", "AnyFLEX", "AnyFLEX", "AnyFLEX"]
 
 
 def lineup_display_sort(lineup: pl.DataFrame) -> pl.DataFrame:
-    """MVP first for single-game; slot order then salary for classic."""
+    """MVP first for tournament; slot order then salary for classic."""
     if "is_mvp" in lineup.columns:
         return lineup.sort(["is_mvp", "salary"], descending=[True, True])
     return lineup.sort(pl.col("position").replace_strict(SLOT_ORDER), "salary",
@@ -329,23 +363,34 @@ def upload_row(lineup: pl.DataFrame) -> list[str]:
             + by_pos["TE"][:1] + flex + by_pos["DST"][:1])
 
 
+def lineup_stem(lineups: list[pl.DataFrame], season: int, week: int,
+                mode: str) -> Path:
+    """Output path stem: {season}_w{week}_{mode} for classic, plus
+    _tournament_{TEAM-TEAM} (alphabetical) for single-game builds."""
+    stem = f"{season}_w{week:02d}_{mode}"
+    if lineups and "is_mvp" in lineups[0].columns:
+        stem += "_tournament_" + "-".join(sorted(set(lineups[0]["team"])))
+    return LINEUPS_DIR / stem
+
+
 def write_lineups(lineups: list[pl.DataFrame], season: int, week: int,
-                  mode: str) -> None:
-    """Readable CSV + FanDuel bulk-upload CSV for a lineup set."""
+                  mode: str) -> Path:
+    """Readable CSV + FanDuel bulk-upload CSV for a lineup set; returns
+    the shared path stem."""
     LINEUPS_DIR.mkdir(parents=True, exist_ok=True)
     single = bool(lineups) and "is_mvp" in lineups[0].columns
-    stem = f"{season}_w{week:02d}_{mode}" + ("_single" if single else "")
+    stem = lineup_stem(lineups, season, week, mode)
     readable = [
         lineup_display_sort(lu)
         .drop("idx", "score", strict=False)
         .with_columns(pl.lit(i).alias("lineup"))
         for i, lu in enumerate(lineups, 1)
     ]
-    pl.concat(readable).write_csv(LINEUPS_DIR / f"{stem}.csv")
+    pl.concat(readable).write_csv(stem.with_name(stem.name + ".csv"))
     # plain text: the header repeats slot names (RB,RB,WR,WR,WR), which
     # a DataFrame can't represent
-    header = SINGLE_UPLOAD_HEADER if single else UPLOAD_HEADER
-    upload_path = LINEUPS_DIR / f"{stem}_upload.csv"
+    header = TOURNAMENT_UPLOAD_HEADER if single else UPLOAD_HEADER
+    upload_path = stem.with_name(stem.name + "_upload.csv")
     with open(upload_path, "w") as f:
         f.write(",".join(header) + "\n")
         for lu in lineups:
@@ -353,6 +398,7 @@ def write_lineups(lineups: list[pl.DataFrame], season: int, week: int,
             if len(row) != len(header) or any(not v for v in row):
                 raise ValueError(f"lineup missing slate IDs for upload: {row}")
             f.write(",".join(row) + "\n")
+    return stem
 
 
 def main() -> None:
@@ -372,13 +418,16 @@ def main() -> None:
     ap.add_argument("--max-exposure", type=float, default=1.0,
                     help="max share of the N lineups any player may appear in "
                          "(e.g. 0.5); locked players are exempt")
+    ap.add_argument("--format", choices=FORMATS, default="auto",
+                    help="classic (9-man) or tournament (MVP + 5 FLEX); "
+                         "auto detects from the value sheet")
     args = ap.parse_args()
 
     lineups = generate(args.season, args.week, args.mode, args.n, args.min_diff,
                        args.lock, args.exclude, args.stack,
                        args.allow_dst_conflict, args.slate,
                        allow_risky=args.allow_risky,
-                       max_exposure=args.max_exposure)
+                       max_exposure=args.max_exposure, fmt=args.format)
     if not lineups:
         raise SystemExit("no feasible lineup — loosen constraints")
 
@@ -394,9 +443,7 @@ def main() -> None:
         with pl.Config(tbl_rows=9, tbl_width_chars=140, tbl_hide_dataframe_shape=True):
             print(show)
 
-    write_lineups(lineups, args.season, args.week, args.mode)
-    suffix = "_single" if "is_mvp" in lineups[0].columns else ""
-    stem = LINEUPS_DIR / f"{args.season}_w{args.week:02d}_{args.mode}{suffix}"
+    stem = write_lineups(lineups, args.season, args.week, args.mode)
     print(f"\nwrote {stem}.csv and {stem}_upload.csv")
 
 

@@ -10,8 +10,14 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = REPO_ROOT / "config.toml"
 
 DEFAULTS = {
-    "lineups": {"cash": 1, "gpp": 3, "gpp_stack": True, "min_diff": 2,
-                "max_exposure": 1.0},
+    "lineups": {
+        # classic (9-man) builds from full-slate exports
+        "cash": 1, "gpp": 3, "gpp_stack": True, "min_diff": 2,
+        "max_exposure": 1.0,
+        # tournament (MVP + 5 FLEX) builds from single-game exports
+        "tournament_cash": 1, "tournament_gpp": 3,
+        "tournament_max_exposure": 1.0,
+    },
 }
 
 

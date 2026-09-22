@@ -7,3 +7,13 @@ gpp = 9           # ceiling-weighted lineups
 gpp_stack = true  # force QB + WR/TE teammate in GPP builds
 min_diff = 2      # each lineup differs from every prior one by >= this many players
 max_exposure = 0.5  # no player in more than this share of the GPP lineups (1.0 = no cap)
+
+# Tournament (FanDuel single-game) builds: 6 players under the same $60k cap,
+# one MVP slot at 1.5x points and 1.5x salary plus 5 FLEX of any position.
+# Built whenever a single-game players-list export for the week is in
+# data/raw/fanduel/, in addition to the classic lineups above.
+tournament_cash = 1   # floor-weighted tournament lineups
+tournament_gpp = 9    # ceiling-weighted tournament lineups
+tournament_max_exposure = 1.0  # separate cap: with only two teams in the pool,
+                               # a tight cap runs out of starters after a few
+                               # lineups and the rest come back badly under-salary

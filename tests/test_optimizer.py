@@ -115,3 +115,97 @@ def test_max_exposure_exempts_locks(monkeypatch):
                                  max_exposure=0.34)
     assert len(lineups) == 3
     assert all("AAA QB0" in lu["fd_name"].to_list() for lu in lineups)
+
+
+def tournament_pool() -> pl.DataFrame:
+    """Single-game export shape: 2 teams, MVP roster position, MVP salary."""
+    rows = []
+    for ti, team in enumerate(["AAA", "BBB"]):
+        opp = "BBB" if team == "AAA" else "AAA"
+        specs = [("QB", 1), ("RB", 2), ("WR", 3), ("TE", 1), ("K", 1)]
+        for pos, count in specs:
+            for k in range(count):
+                proj = 18 - ti - k * 2.0 + {"QB": 0, "RB": -2, "WR": -4,
+                                            "TE": -8, "K": -10}[pos]
+                salary = 5000 + 1000 * (8 - ti - k)
+                rows.append({
+                    "fd_name": f"{team} {pos}{k}", "position": pos, "team": team,
+                    "opponent_team": opp, "salary": salary,
+                    "mvp_salary": int(salary * 1.5),
+                    "roster_position": "MVP - 1.5X Points/AnyFLEX",
+                    "projection": proj, "p10": proj - 5, "p90": proj + 6,
+                    "sd": 4.0, "cv": 0.5, "injury": None,
+                })
+        rows.append({
+            "fd_name": f"{team} D/ST", "position": "DST", "team": team,
+            "opponent_team": opp, "salary": 4000, "mvp_salary": 6000,
+            "roster_position": "MVP - 1.5X Points/AnyFLEX",
+            "projection": 7.0 - ti, "p10": 1.0, "p90": 14.0, "sd": 4.5,
+            "cv": 0.6, "injury": None,
+        })
+    return pl.DataFrame(rows)
+
+
+def test_tournament_lineup_valid():
+    lu = optimizer.solve_lineup(tournament_pool(), mode="gpp")
+    assert lu is not None
+    optimizer.validate_lineup(lu)
+    assert lu.height == optimizer.TOURNAMENT_SIZE
+    assert lu["is_mvp"].sum() == 1
+    assert lu["team"].n_unique() == 2
+    spend = sum(r["mvp_salary"] if r["is_mvp"] else r["salary"]
+                for r in lu.to_dicts())
+    assert spend <= optimizer.SALARY_CAP
+
+
+def test_tournament_mvp_scores_1_5x():
+    lu = optimizer.solve_lineup(tournament_pool(), mode="mean")
+    s = optimizer.lineup_summary(lu)
+    mvp_proj = lu.filter(pl.col("is_mvp"))["projection"][0]
+    plain = lu["projection"].sum() - mvp_proj
+    assert s["projection"] == round(plain + 1.5 * mvp_proj, 1)
+
+
+def test_format_detection_and_mismatch():
+    assert optimizer.resolve_format(synthetic_pool()) == "classic"
+    assert optimizer.resolve_format(tournament_pool()) == "tournament"
+    with pytest.raises(ValueError, match="not tournament"):
+        optimizer.resolve_format(synthetic_pool(), "tournament")
+    with pytest.raises(ValueError, match="not classic"):
+        optimizer.resolve_format(tournament_pool(), "classic")
+
+
+def test_generate_enforces_requested_format(monkeypatch):
+    monkeypatch.setattr(optimizer, "load_pool", lambda *a, **k: synthetic_pool())
+    with pytest.raises(ValueError):
+        optimizer.generate(2026, 1, "gpp", 1, min_diff=1, locks=[], excludes=[],
+                           stack=False, allow_dst_conflict=False,
+                           slate_path=None, fmt="tournament")
+
+
+def test_tournament_lineups_differ_and_write(monkeypatch, tmp_path):
+    monkeypatch.setattr(optimizer, "load_pool", lambda *a, **k: tournament_pool())
+    monkeypatch.setattr(optimizer, "LINEUPS_DIR", tmp_path)
+    lineups = optimizer.generate(2026, 1, "gpp", 3, min_diff=2, locks=[],
+                                 excludes=[], stack=False,
+                                 allow_dst_conflict=False, slate_path=None,
+                                 fmt="tournament")
+    assert len(lineups) == 3
+    for a in lineups:
+        for b in lineups:
+            if a is not b:
+                assert len(set(a["idx"]) & set(b["idx"])) <= optimizer.TOURNAMENT_SIZE - 2
+    pool = tournament_pool().with_columns(
+        pl.format("1-{}", pl.int_range(pl.len())).alias("fanduel_id"))
+    lineups = [lu.join(pool.select("fd_name", "fanduel_id"), on="fd_name")
+               for lu in lineups]
+    stem = optimizer.write_lineups(lineups, 2026, 1, "gpp")
+    assert stem.name == "2026_w01_gpp_tournament_AAA-BBB"
+    upload = (tmp_path / "2026_w01_gpp_tournament_AAA-BBB_upload.csv").read_text().splitlines()
+    assert upload[0].split(",") == optimizer.TOURNAMENT_UPLOAD_HEADER
+    assert len(upload) == 4 and all(len(r.split(",")) == 6 for r in upload[1:])
+
+
+def test_classic_stem_has_no_suffix():
+    lu = optimizer.solve_lineup(synthetic_pool())
+    assert optimizer.lineup_stem([lu], 2026, 1, "cash").name == "2026_w01_cash"

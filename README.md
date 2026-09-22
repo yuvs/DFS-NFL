@@ -63,7 +63,7 @@ uv run python -m dfs_nfl.value 2026 1   # match latest slate to projections
 Writes `outputs/value/{season}_w{week:02d}_slate{id}.csv`: every matched
 slate player with salary, `value` (projected points per $1K) and
 `value_p90` (ceiling points per $1K — the GPP sort), plus the injury
-indicator from the slate file. Filter out `O`/`IR`/`D` before building
+indicator from the slate file. Filter out `O`/`IR`/`D`/`NA` (not active) before building
 lineups; `Q` players carry extra risk the model can't see.
 
 ## Lineup optimizer
@@ -72,6 +72,7 @@ lineups; `Q` players carry extra risk the model can't see.
 uv run python -m dfs_nfl.optimizer 2026 1 --mode cash
 uv run python -m dfs_nfl.optimizer 2026 1 --mode gpp --n 5 --stack
 uv run python -m dfs_nfl.optimizer 2026 1 --lock "Josh Allen" --exclude "Chase Brown"
+uv run python -m dfs_nfl.optimizer 2026 2 --mode gpp --n 9 --format tournament
 ```
 
 CP-SAT integer program over the value sheet. FanDuel classic rules are
@@ -79,29 +80,47 @@ built in: 9 slots (QB/2RB/3WR/TE/FLEX/DST), $60K cap, max 4 per team,
 3+ teams. `--mode cash` maximizes 0.5·projection + 0.5·p10 and, by
 default, excludes Q-tagged and cold-start players (`--allow-risky` to
 override); `--mode gpp` maximizes 0.5·projection + 0.5·p90 (add
-`--stack` to force a QB + pass-catcher stack). O/IR/D players are always
+`--stack` to force a QB + pass-catcher stack). O/IR/D/NA players are always
 excluded, and lineups never roster offense against their own DST
 (`--allow-dst-conflict` to permit). `--n N --min-diff K` generates N
 lineups each differing by ≥K players. `--max-exposure 0.5` keeps any one
 player out of more than half the lineups (locked players exempt). Lineup totals report a range of
 proj ± 1.28·√(Σsd²) — per-player p10/p90 don't sum.
 
+**Tournament (single-game) lineups.** FanDuel's single-game contests use
+6 players under the same $60K cap: one MVP slot scoring 1.5x points at
+1.5x salary, plus 5 FLEX slots open to any position (both teams must
+be represented). Download that contest's own players list — its MVP
+salaries and slate IDs differ from the full slate's — and the optimizer
+detects the format from the export's MVP roster column. `--format
+tournament` (or `classic`) makes the expectation explicit and fails
+loudly if the newest value sheet is the other kind. Stacking and the
+DST-conflict rule don't apply. The exposure cap bites hard here: with
+two teams in the pool, a 50% cap runs out of starting QBs after a few
+lineups, so leave it at 1.0 or use small counts.
+
 Each run writes two files per mode to `outputs/lineups/`:
 `{season}_w{week:02d}_{mode}.csv` (readable, one row per player) and
 `..._upload.csv` — FanDuel's bulk-entry format (slot header
-`QB,RB,RB,WR,WR,WR,TE,FLEX,DEF`, slate player IDs as cells). On the
-contest entry screen choose "Upload lineups from CSV" and hand it the
-upload file. IDs are slate-specific, so regenerate after downloading a
-new players list.
+`QB,RB,RB,WR,WR,WR,TE,FLEX,DEF`, slate player IDs as cells). Tournament
+builds get a `_tournament_{TEAM-TEAM}` suffix (e.g.
+`2026_w02_gpp_tournament_LA-NYG.csv`) and the
+`MVP - 1.5X Points,AnyFLEX,...` header, so a Thursday and a Monday
+build in the same week coexist. On the contest entry screen choose
+"Upload lineups from CSV" and hand it the upload file. IDs are
+slate-specific, so regenerate after downloading a new players list.
 
-`weekly` also auto-builds the value sheet and cash/GPP lineups when a
-FanDuel slate CSV for the target week is in `data/raw/fanduel/` (matched
-by the date in the export's filename). The only manual step each week is
-downloading that CSV from the FanDuel lobby.
+`weekly` also auto-builds a value sheet and lineups for every FanDuel
+slate CSV of the target week in `data/raw/fanduel/` (matched by the date
+in the export's filename): full-slate exports get the classic cash/GPP
+builds, single-game exports get the tournament builds. The only manual
+step each week is downloading those CSVs from the FanDuel lobby.
 
 How many lineups the automated run builds is set in `config.toml`
-(`[lineups]`: `cash`, `gpp`, `gpp_stack`, `min_diff`, `max_exposure`; set a
-count to 0 to skip that mode). Missing file or keys fall back to defaults, and ad-hoc
+(`[lineups]`: `cash`, `gpp`, `gpp_stack`, `min_diff`, `max_exposure` for
+classic slates; `tournament_cash`, `tournament_gpp`,
+`tournament_max_exposure` for single-game slates; set a count to 0 to
+skip that build). Missing file or keys fall back to defaults, and ad-hoc
 `dfs_nfl.optimizer` runs use CLI flags instead.
 
 Automation runs via launchd (survives sleep, unlike cron): agents
