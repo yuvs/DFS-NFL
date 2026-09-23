@@ -48,10 +48,27 @@ POSITION_PARAMS = {
 }
 NUM_ROUNDS = 300
 
-# Final prediction blends the LightGBM output with baseline B2; the blend
-# beat both components at every position on 2024-25 and is insensitive to
-# the exact weight across 0.5-0.7.
-BLEND_WEIGHT = 0.6
+# Final prediction blends the LightGBM output with baseline B2. Re-tuned
+# for the huber model on 2024-25: 0.8 is best or within noise of best on
+# MAE, RMSE and Spearman at every position (0.6 was right for the L2
+# model; the stronger model now carries more of the weight).
+BLEND_WEIGHT = 0.8
+
+# Production training variant (see experiments.py for the grid):
+#   residual   - predict fd_points - pred_b2 instead of raw points
+#   decay      - row weight 0.5 ** (seasons_ago / decay)
+#   objective  - regression | huber | tweedie
+#   early_stop - rounds from early stopping on the last full train season
+# Per-position overrides win over "default".
+# Huber (delta 4 pts, ~one MAE) won the 2024-25 walk-forward grid at every
+# position on MAE and Spearman: fantasy points are right-skewed, and L2
+# spent the trees chasing boom weeks. Residual-over-B2 targets, recency
+# weights and early stopping were neutral to slightly worse.
+MODEL_SPEC: dict[str, dict] = {"default": {"objective": "huber"}}
+
+
+def model_spec(pos: str) -> dict:
+    return MODEL_SPEC.get(pos, MODEL_SPEC["default"])
 
 
 def load_features(pos: str) -> pl.DataFrame:
@@ -88,6 +105,104 @@ def to_matrix(df: pl.DataFrame, cols: list[str]) -> np.ndarray:
     return df.select([pl.col(c).cast(pl.Float64) for c in cols]).to_numpy()
 
 
+HUBER_DELTA = 4.0            # roughly one MAE: quadratic inside, linear beyond
+TWEEDIE_POWER = 1.3
+EARLY_MAX_ROUNDS = 1500
+EARLY_PATIENCE = 50
+
+
+def variant_params(pos: str, spec: dict) -> dict:
+    params = LGB_PARAMS | POSITION_PARAMS.get(pos, {})
+    obj = spec.get("objective", "regression")
+    params["objective"] = obj
+    if obj == "huber":
+        params["alpha"] = HUBER_DELTA
+    if obj == "tweedie":
+        params["tweedie_variance_power"] = TWEEDIE_POWER
+    return params
+
+
+def sample_weights(seasons: np.ndarray, decay: float | None) -> np.ndarray | None:
+    if not decay:
+        return None
+    return 0.5 ** ((seasons.max() - seasons) / decay)
+
+
+class Trainer:
+    """One variant's fit/predict, with the target transform and the
+    early-stopping round cache."""
+
+    def __init__(self, pos: str, spec: dict):
+        self.pos, self.spec = pos, spec
+        self.params = variant_params(pos, spec)
+        self.residual = spec.get("residual", False)
+        self.decay = spec.get("decay")
+        self.early = spec.get("early_stop", False)
+        self.rounds_cache: dict[int, int] = {}
+        self.rounds_used: list[int] = []
+
+    # -- target transform ------------------------------------------------
+    def _label(self, df: pl.DataFrame) -> np.ndarray:
+        y = df["fd_points"].to_numpy().astype(float)
+        if self.residual:
+            y = y - df["pred_b2"].to_numpy().astype(float)
+        return y
+
+    def _fit(self, x, y, w, rounds, valid=None) -> lgb.Booster:
+        y_shift = 0.0
+        if self.params["objective"] == "tweedie":
+            y_shift = float(y.min())
+            y = y - y_shift
+            if valid is not None:
+                valid = (valid[0], valid[1] - y_shift, valid[2])
+        self._shift = y_shift
+        train_set = lgb.Dataset(x, label=y, weight=w)
+        if valid is None:
+            return lgb.train(self.params, train_set, num_boost_round=rounds)
+        vx, vy, vw = valid
+        return lgb.train(
+            self.params, train_set, num_boost_round=rounds,
+            valid_sets=[lgb.Dataset(vx, label=vy, weight=vw)],
+            callbacks=[lgb.early_stopping(EARLY_PATIENCE, verbose=False)],
+        )
+
+    def _rounds(self, train: pl.DataFrame, cols: list[str], eval_season: int) -> int:
+        if not self.early:
+            return NUM_ROUNDS
+        if eval_season in self.rounds_cache:
+            return self.rounds_cache[eval_season]
+        last = int(train["season"].max())
+        fit = train.filter(pl.col("season") < last)
+        val = train.filter(pl.col("season") == last)
+        if fit.height < 1000 or val.height < 200:
+            self.rounds_cache[eval_season] = NUM_ROUNDS
+            return NUM_ROUNDS
+        booster = self._fit(
+            to_matrix(fit, cols), self._label(fit),
+            sample_weights(fit["season"].to_numpy(), self.decay), EARLY_MAX_ROUNDS,
+            valid=(to_matrix(val, cols), self._label(val),
+                   sample_weights(val["season"].to_numpy(), self.decay)),
+        )
+        best = max(50, int(booster.best_iteration or NUM_ROUNDS))
+        self.rounds_cache[eval_season] = best
+        return best
+
+    def fit_predict(self, train: pl.DataFrame, test: pl.DataFrame,
+                    cols: list[str], eval_season: int) -> np.ndarray:
+        if self.residual:
+            train = train.filter(pl.col("pred_b2").is_not_null())
+        rounds = self._rounds(train, cols, eval_season)
+        self.rounds_used.append(rounds)
+        self.booster = self._fit(
+            to_matrix(train, cols), self._label(train),
+            sample_weights(train["season"].to_numpy(), self.decay), rounds,
+        )
+        yhat = self.booster.predict(to_matrix(test, cols)) + self._shift
+        if self.residual:
+            yhat = yhat + test["pred_b2"].fill_null(0.0).to_numpy()
+        return yhat
+
+
 def backtest_position(pos: str, baselines: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
     df = (
         load_features(pos)
@@ -95,7 +210,7 @@ def backtest_position(pos: str, baselines: pl.DataFrame) -> tuple[pl.DataFrame, 
         .sort(["season", "week", "game_id", "player_id"])
     )
     cols = feature_columns(df)
-    params = LGB_PARAMS | POSITION_PARAMS.get(pos, {})
+    trainer = Trainer(pos, model_spec(pos))
     eval_weeks = (
         df.filter(pl.col("season").is_in(EVAL_SEASONS))
         .select("season", "week").unique().sort(["season", "week"]).rows()
@@ -112,13 +227,8 @@ def backtest_position(pos: str, baselines: pl.DataFrame) -> tuple[pl.DataFrame, 
         )
         if not test.height:
             continue
-        booster = lgb.train(
-            params,
-            lgb.Dataset(to_matrix(train, cols), label=train["fd_points"].to_numpy()),
-            num_boost_round=NUM_ROUNDS,
-        )
-        yhat = booster.predict(to_matrix(test, cols))
-        importances += booster.feature_importance(importance_type="gain")
+        yhat = trainer.fit_predict(train, test, cols, season)
+        importances += trainer.booster.feature_importance(importance_type="gain")
         preds.append(test.select(
             "player_id", "game_id", "season", "week", "position", "fd_points",
         ).with_columns(pl.Series("pred_model", yhat)))

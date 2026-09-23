@@ -8,6 +8,9 @@ outputs/value/{season}_w{week:02d}_slate{id}.csv with salary, value
 Matching: DSTs by team; players by normalized name + team + position,
 falling back to name + position (handles team-data lags), then unique
 last name + team + position. Unmatched slate players are reported.
+Each matched player also carries depth_rank from the freshest depth
+chart at or before the week (1 = starter), which the optimizer uses
+to skip backup QBs.
 
 Usage: uv run python -m dfs_nfl.value <season> <week> [slate_csv_path]
 """
@@ -22,7 +25,7 @@ import polars as pl
 
 from dfs_nfl.baselines import OUTPUTS_DIR
 from dfs_nfl.features import RAW_DIR
-from dfs_nfl.predict import PROJECTIONS_DIR
+from dfs_nfl.predict import PROJECTIONS_DIR, _depth_chart_universe
 
 FANDUEL_DIR = RAW_DIR / "fanduel"
 VALUE_DIR = OUTPUTS_DIR / "value"
@@ -125,19 +128,34 @@ def match_slate(slate: pl.DataFrame, proj: pl.DataFrame) -> tuple[pl.DataFrame, 
     keep = ["fanduel_id", "fd_name", "position", "team", "salary", "mvp_salary", "injury",
             "roster_position", "player_id", "name", "opponent_team",
             "projection", "p10", "p50", "p90", "sd", "cv", "skew",
-            "team_implied_total", "opp_implied_total", "confidence"]
+            "team_implied_total", "opp_implied_total", "confidence",
+            "depth_rank"]
     parts = [df.select([c for c in keep if c in df.columns])
              for df in (dst, matched, matched2, matched3)]
     return pl.concat(parts, how="diagonal_relaxed"), unmatched
+
+
+def depth_ranks(season: int, week: int) -> pl.DataFrame:
+    """(player_id, depth_rank) from the freshest depth chart at or before
+    the week; empty (all-null join) if no chart is available."""
+    try:
+        dc = _depth_chart_universe(season, week)
+    except FileNotFoundError:
+        return pl.DataFrame({"player_id": [], "depth_rank": []},
+                            schema={"player_id": pl.String, "depth_rank": pl.Int32})
+    return dc.select(pl.col("gsis_id").alias("player_id"), "depth_rank")
 
 
 def value_sheet_path(season: int, week: int, slate_path: Path) -> Path:
     return VALUE_DIR / f"{season}_w{week:02d}_slate{slate_id(slate_path)}.csv"
 
 
-def build_value_sheet(season: int, week: int, slate_path: Path | None = None) -> pl.DataFrame:
+def build_value_sheet(season: int, week: int, slate_path: Path | None = None,
+                      projections_path: Path | None = None) -> pl.DataFrame:
+    """projections_path overrides the week's main projection file (e.g. a
+    slate-time re-projection for a single-game slate)."""
     slate_path = slate_path or latest_slate_file()
-    proj_path = PROJECTIONS_DIR / f"{season}_w{week:02d}.parquet"
+    proj_path = projections_path or PROJECTIONS_DIR / f"{season}_w{week:02d}.parquet"
     if not proj_path.exists():
         raise FileNotFoundError(f"run dfs_nfl.predict first: {proj_path}")
     slate = load_slate(slate_path)
@@ -146,6 +164,7 @@ def build_value_sheet(season: int, week: int, slate_path: Path | None = None) ->
     matched, unmatched = match_slate(slate, proj)
     sheet = (
         matched.filter(pl.col("projection").is_not_null())
+        .join(depth_ranks(season, week), on="player_id", how="left")
         .with_columns(
             (pl.col("projection") / (pl.col("salary") / 1000)).round(3).alias("value"),
             (pl.col("p90") / (pl.col("salary") / 1000)).round(3).alias("value_p90"),

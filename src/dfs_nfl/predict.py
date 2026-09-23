@@ -11,12 +11,19 @@ anyone with a stat line for those teams in the last 4 completed weeks,
 plus both team defenses per game. Players with <2 career games get the
 cold-start prior and confidence="low".
 
+Slate-time re-projection: predict_week(..., teams=[...], tag="_slateNNN")
+restricts the universe to those teams and writes a separately-named
+file, so a Thursday/Monday single-game slate can be projected with
+that day's injury report and depth chart without touching the week's
+main projection file (which the scorecard grades).
+
 Usage: uv run python -m dfs_nfl.predict <season> <week> [--no-refresh]
 """
 
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import lightgbm as lgb
 import numpy as np
@@ -38,10 +45,11 @@ from dfs_nfl.features import (
 from dfs_nfl.models import (
     BLEND_WEIGHT,
     LGB_PARAMS,
-    NUM_ROUNDS,
     POSITION_PARAMS,
     POSITIONS,
+    Trainer,
     feature_columns,
+    model_spec,
     to_matrix,
 )
 
@@ -49,21 +57,34 @@ PROJECTIONS_DIR = OUTPUTS_DIR / "projections"
 OFFENSE_POSITIONS = ["QB", "RB", "WR", "TE"]
 
 
-def refresh_data(season: int) -> None:
-    """Re-ingest the current season (idempotent) and rebuild labels.
-    Sources that don't exist yet (e.g. week 1 of a new season) are skipped."""
+# the two sources that change between a Sunday-morning projection and a
+# Thursday/Monday kickoff: who's ruled out, and who's been promoted
+PREGAME_SOURCES = ["injuries", "depth_charts"]
+
+
+def refresh_sources(season: int, names: list[str] | None = None) -> None:
+    """Re-ingest the given nflverse sources for the season (all of them by
+    default). Sources that don't exist yet (e.g. week 1 of a new season)
+    or can't be reached are skipped, never fatal."""
     from dfs_nfl import ingest
 
-    for name, loader in ingest.SOURCES.items():
+    for name in names or list(ingest.SOURCES):
         try:
             out_dir = RAW_DIR / name
             out_dir.mkdir(parents=True, exist_ok=True)
-            df = loader(season)
+            df = ingest.SOURCES[name](season)
             if df.height:
                 df.write_parquet(out_dir / f"{name}_{season}.parquet")
                 print(f"  refreshed {name}_{season}: {df.height:,} rows")
         except Exception as e:  # noqa: BLE001 - source not yet published
             print(f"  {name} {season}: unavailable ({type(e).__name__}), skipped")
+
+
+def refresh_data(season: int) -> None:
+    """Re-ingest the current season (idempotent) and rebuild labels."""
+    from dfs_nfl import ingest
+
+    refresh_sources(season)
     ingest.ingest_schedules()
     ingest.ingest_playerids()
     ingest.ingest_players()
@@ -117,8 +138,11 @@ def _depth_chart_universe(season: int, week: int) -> pl.DataFrame:
     raise FileNotFoundError("no depth charts available for universe")
 
 
-def offense_skeleton(season: int, week: int) -> pl.DataFrame:
+def offense_skeleton(season: int, week: int,
+                     teams: list[str] | None = None) -> pl.DataFrame:
     games = week_games(season, week)
+    if teams:
+        games = games.filter(pl.col("team").is_in(teams))
     players = pl.read_parquet(RAW_DIR / "players.parquet").select(
         pl.col("gsis_id").alias("player_id"),
         pl.col("display_name").alias("player_display_name"),
@@ -167,8 +191,12 @@ def offense_skeleton(season: int, week: int) -> pl.DataFrame:
     )
 
 
-def dst_skeleton(season: int, week: int) -> pl.DataFrame:
-    return week_games(season, week).with_columns(
+def dst_skeleton(season: int, week: int,
+                 teams: list[str] | None = None) -> pl.DataFrame:
+    games = week_games(season, week)
+    if teams:
+        games = games.filter(pl.col("team").is_in(teams))
+    return games.with_columns(
         pl.lit(season, dtype=pl.Int32).alias("season"),
         pl.lit(week, dtype=pl.Int32).alias("week"),
         pl.lit("REG").alias("season_type"),
@@ -227,9 +255,8 @@ def _train_and_predict(df: pl.DataFrame, pos: str, season: int, week: int) -> pl
     x_train, y_train = to_matrix(train, cols), train["fd_points"].to_numpy()
     x_test = to_matrix(test, cols)
 
-    mean_pred = lgb.train(
-        params, lgb.Dataset(x_train, label=y_train), num_boost_round=NUM_ROUNDS
-    ).predict(x_test)
+    # mean model: the production variant from models.MODEL_SPEC
+    mean_pred = Trainer(pos, model_spec(pos)).fit_predict(train, test, cols, season)
 
     qparams = params | {"objective": "quantile"}
     qhat = np.sort(np.column_stack([
@@ -294,13 +321,26 @@ def _cold_start_override(preds: pl.DataFrame, feats_off: pl.DataFrame,
     )
 
 
-def predict_week(season: int, week: int, refresh: bool = True) -> pl.DataFrame:
+def projection_path(season: int, week: int, tag: str = "") -> Path:
+    return PROJECTIONS_DIR / f"{season}_w{week:02d}{tag}.parquet"
+
+
+def predict_week(season: int, week: int, refresh: bool = True,
+                 teams: list[str] | None = None, tag: str = "",
+                 extra_outs: pl.DataFrame | None = None) -> pl.DataFrame:
+    """Project the week. `teams` limits the universe to those teams (a
+    single-game slate); `tag` is appended to the output filename so such
+    a run doesn't overwrite the week's main projections; `extra_outs`
+    (season, week, team, gsis_id, position) are game-day inactives from
+    the slate export, treated as Out for injury/vacated features."""
     if refresh:
         print("refreshing data...")
         refresh_data(season)
     print("building prediction frames...")
-    skel_off = offense_skeleton(season, week)
-    skel_dst = dst_skeleton(season, week)
+    skel_off = offense_skeleton(season, week, teams)
+    skel_dst = dst_skeleton(season, week, teams)
+    if not skel_dst.height:
+        raise ValueError(f"no games for {teams} in {season} week {week}")
     skel_panel = _skeleton_panel(skel_off, skel_dst)
     base_preds = build_predictions(
         pl.concat(
@@ -310,7 +350,8 @@ def predict_week(season: int, week: int, refresh: bool = True) -> pl.DataFrame:
         )
     ).select("player_id", "game_id", "pred_b1", "pred_b2")
 
-    feats_off = _apply_weather(build_offense_features(skeleton=skel_off), season, week)
+    feats_off = _apply_weather(
+        build_offense_features(skeleton=skel_off, extra_outs=extra_outs), season, week)
     feats_dst = _apply_weather(build_dst_features(skeleton=skel_dst), season, week)
 
     print("training and predicting...")
@@ -358,7 +399,7 @@ def predict_week(season: int, week: int, refresh: bool = True) -> pl.DataFrame:
         ))
     projections = pl.concat(out).sort("projection", descending=True)
     PROJECTIONS_DIR.mkdir(parents=True, exist_ok=True)
-    stem = PROJECTIONS_DIR / f"{season}_w{week:02d}"
+    stem = projection_path(season, week, tag).with_suffix("")
     projections.write_csv(f"{stem}.csv")
     projections.write_parquet(f"{stem}.parquet")
     print(f"\nwrote {stem}.csv ({projections.height} rows)")

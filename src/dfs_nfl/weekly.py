@@ -4,6 +4,12 @@ week present in data/raw/fanduel/, build its value sheet and lineups:
 classic exports get the cash/GPP counts from config.toml, single-game
 exports get the tournament (MVP + 5 FLEX) counts.
 
+Single-game slates are re-projected at slate time: the injury report and
+depth chart are refreshed and the two teams are projected into their own
+file (outputs/projections/{season}_w{week}_slate{id}), so a Monday
+inactive (a WR1 ruled out) reaches the vacated-opportunity features
+instead of being missed by the Sunday-morning projection.
+
 Figures out the current season/week from the schedule (first REG week
 with an unplayed game), so a scheduled job needs no arguments:
 
@@ -18,10 +24,11 @@ from __future__ import annotations
 import polars as pl
 
 from dfs_nfl.features import RAW_DIR
-from dfs_nfl.predict import PROJECTIONS_DIR, predict_week, refresh_data
+from dfs_nfl.predict import (PREGAME_SOURCES, PROJECTIONS_DIR, predict_week,
+                             projection_path, refresh_data, refresh_sources)
 from dfs_nfl.scorecard import score_week
-from dfs_nfl.value import (FANDUEL_DIR, build_value_sheet, slate_date, slate_id,
-                           value_sheet_path)
+from dfs_nfl.value import (FANDUEL_DIR, build_value_sheet, load_slate, match_slate,
+                           slate_date, slate_id, value_sheet_path)
 
 
 def next_week() -> tuple[int, int]:
@@ -71,6 +78,45 @@ def lineup_plans(fmt: str, lu_cfg: dict) -> list[tuple[str, int, bool, float]]:
             ("gpp", lu_cfg["gpp"], lu_cfg["gpp_stack"], cap)]
 
 
+def slate_inactives(season: int, week: int, raw: pl.DataFrame) -> pl.DataFrame:
+    """Slate players tagged O/IR/D/NA, mapped to gsis ids through the
+    week's main projections. FanDuel's game-day tags (NA = declared
+    inactive) arrive after nflverse's Friday injury report, so this is
+    the only place a Monday-night scratch is visible before kickoff."""
+    from dfs_nfl.optimizer import OUT_TAGS
+
+    tagged = raw.filter(pl.col("injury").is_in(OUT_TAGS)
+                        & (pl.col("position") != "DST"))
+    proj = pl.read_parquet(projection_path(season, week))
+    matched, _ = match_slate(tagged, proj)
+    return matched.filter(pl.col("player_id").is_not_null()).select(
+        pl.lit(season, dtype=pl.Int32).alias("season"),
+        pl.lit(week, dtype=pl.Int32).alias("week"),
+        "team", pl.col("player_id").alias("gsis_id"), "position",
+    )
+
+
+def reproject_slate(season: int, week: int, slate, raw: pl.DataFrame):
+    """Fresh injuries + depth chart plus the slate's own inactive tags,
+    then project just the slate's teams into a slate-tagged file. Falls
+    back to the week's main projections (returns None) if the
+    re-projection fails for any reason."""
+    teams = sorted(raw["team"].unique().to_list())
+    tag = f"_slate{slate_id(slate)}"
+    try:
+        refresh_sources(season, PREGAME_SOURCES)
+        outs = slate_inactives(season, week, raw)
+        if outs.height:
+            print(f"  slate inactives applied: {outs.height}")
+        predict_week(season, week, refresh=False, teams=teams, tag=tag,
+                     extra_outs=outs)
+    except Exception as e:  # noqa: BLE001 - never block lineups on this
+        print(f"  slate re-projection failed ({type(e).__name__}: {e}); "
+              "using the week's main projections")
+        return None
+    return projection_path(season, week, tag)
+
+
 def build_slate_outputs(season: int, week: int) -> None:
     slates = week_slate_files(season, week)
     if not slates:
@@ -83,10 +129,14 @@ def build_slate_outputs(season: int, week: int) -> None:
 
     lu_cfg = load_config()["lineups"]
     for slate in slates:
-        sheet = build_value_sheet(season, week, slate)
-        sheet_path = value_sheet_path(season, week, slate)
-        fmt = "tournament" if is_tournament(sheet) else "classic"
+        raw = load_slate(slate)
+        fmt = "tournament" if is_tournament(raw) else "classic"
         print(f"{slate.name}: {fmt} slate")
+        proj = None
+        if fmt == "tournament":
+            proj = reproject_slate(season, week, slate, raw)
+        sheet = build_value_sheet(season, week, slate, projections_path=proj)
+        sheet_path = value_sheet_path(season, week, slate)
         for mode, n, stack, cap in lineup_plans(fmt, lu_cfg):
             if n < 1:
                 continue

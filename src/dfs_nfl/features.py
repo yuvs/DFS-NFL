@@ -23,6 +23,11 @@ from dfs_nfl.baselines import (
     load_panel,
     opponent_allowed_factor,
 )
+from dfs_nfl.pbp_features import (
+    PLAYER_OPP_COLS,
+    player_opportunity,
+    team_context_tables,
+)
 
 RAW_DIR = REPO_ROOT / "data" / "raw"
 
@@ -31,6 +36,8 @@ OFFENSE_TRAILING_COLS = [
     "receiving_air_yards", "carries", "rushing_yards", "rushing_tds",
     "attempts", "passing_yards", "passing_tds", "passing_interceptions",
     "target_share", "air_yards_share", "wopr", "snap_pct",
+    # play-by-play opportunity: red-zone / goal-line usage, expected TDs
+    *PLAYER_OPP_COLS,
 ]
 DST_TRAILING_COLS = [
     "fd_points", "event_points", "points_allowed", "def_sacks", "takeaways",
@@ -159,29 +166,44 @@ PRACTICE_ORD = {
 }
 
 
-def _read_injuries() -> pl.DataFrame:
+INJURY_SCHEMA = {"season": pl.Int32, "week": pl.Int32, "team": pl.Utf8,
+                 "gsis_id": pl.Utf8, "position": pl.Utf8,
+                 "report_status": pl.Utf8, "practice_status": pl.Utf8}
+
+
+def _read_injuries(extra_outs: pl.DataFrame | None = None) -> pl.DataFrame:
+    """nflverse injury reports (the official Wed-Fri reports). extra_outs
+    — (season, week, team, gsis_id, position) — are appended as 'Out':
+    game-day inactives that only show up in a slate export."""
     files = sorted((RAW_DIR / "injuries").glob("*.parquet"))
-    if not files:
-        return pl.DataFrame(schema={"season": pl.Int32, "week": pl.Int32,
-                                    "team": pl.Utf8, "gsis_id": pl.Utf8,
-                                    "position": pl.Utf8, "report_status": pl.Utf8,
-                                    "practice_status": pl.Utf8})
-    return (
-        pl.concat([pl.read_parquet(f) for f in files], how="vertical_relaxed")
-        .filter(pl.col("game_type") == "REG")
-        .with_columns(
-            pl.col("season").cast(pl.Int32),
-            pl.col("week").cast(pl.Int32),
+    inj = pl.DataFrame(schema=INJURY_SCHEMA)
+    if files:
+        inj = (
+            pl.concat([pl.read_parquet(f) for f in files], how="vertical_relaxed")
+            .filter(pl.col("game_type") == "REG")
+            .select(list(INJURY_SCHEMA))
+            .with_columns(
+                pl.col("season").cast(pl.Int32),
+                pl.col("week").cast(pl.Int32),
+            )
         )
-    )
+    if extra_outs is not None and extra_outs.height:
+        extra = extra_outs.select(
+            pl.col("season").cast(pl.Int32), pl.col("week").cast(pl.Int32),
+            "team", "gsis_id", "position",
+            pl.lit("Out").alias("report_status"),
+            pl.lit(None, dtype=pl.Utf8).alias("practice_status"),
+        )
+        inj = pl.concat([inj, extra], how="vertical_relaxed")
+    return inj
 
 
-def injury_status_table() -> pl.DataFrame:
+def injury_status_table(extra_outs: pl.DataFrame | None = None) -> pl.DataFrame:
     """(season, week, player_id) -> own report/practice status, ordinal.
     Reports finalize Friday before Sunday games, so they are
     pre-kickoff-safe under the Sunday-morning snapshot rule."""
     return (
-        _read_injuries()
+        _read_injuries(extra_outs)
         .with_columns(
             pl.col("report_status").replace_strict(STATUS_ORD, default=0)
             .alias("inj_status"),
@@ -193,7 +215,7 @@ def injury_status_table() -> pl.DataFrame:
     )
 
 
-def vacated_table() -> pl.DataFrame:
+def vacated_table(extra_outs: pl.DataFrame | None = None) -> pl.DataFrame:
     """Per (season, week, team, position): trailing FD points of teammates
     ruled Out/Doubtful that week — the opportunity they vacate. Only
     players who appeared within the last 5 schedule weeks count, so
@@ -213,7 +235,7 @@ def vacated_table() -> pl.DataFrame:
         .sort("wk_idx")
     )
     out = (
-        _read_injuries()
+        _read_injuries(extra_outs)
         .filter(pl.col("report_status").is_in(["Out", "Doubtful"])
                 & pl.col("position").is_in(["QB", "RB", "WR", "TE"]))
         .select(
@@ -245,12 +267,24 @@ def vacated_table() -> pl.DataFrame:
     return per_pos, per_team
 
 
-def _with_opp_and_context(df: pl.DataFrame, panel_for_opp: pl.DataFrame) -> pl.DataFrame:
+def _with_opp_and_context(df: pl.DataFrame, panel_for_opp: pl.DataFrame,
+                          dst: bool = False) -> pl.DataFrame:
+    """Opponent-allowed factor, Vegas/venue context, and the play-by-play
+    team tables: pace/pass tendency of the offense and split-EPA allowed
+    by the defense. For players the offense is their own team and the
+    defense is the opponent; for DST the roles flip."""
     opp = opponent_allowed_factor(panel_for_opp)
+    off_tbl, def_tbl = team_context_tables()
+    own, other = (def_tbl, off_tbl) if dst else (off_tbl, def_tbl)
+    other = other.rename({c: c.replace("team_", "opp_", 1)
+                          for c in other.columns if c.startswith("team_")})
     return (
         df.join(opp, on=["season", "week", "opponent_team", "position"], how="left")
         .with_columns(pl.col("opp_factor_raw").fill_null(1.0))
         .join(game_context(), on=["game_id", "team"], how="left")
+        .join(own, on=["season", "week", "team"], how="left")
+        .join(other.rename({"team": "opponent_team"}),
+              on=["season", "week", "opponent_team"], how="left")
     )
 
 
@@ -268,10 +302,12 @@ def _panel_with_skeleton(skeleton: pl.DataFrame | None) -> pl.DataFrame:
     )
 
 
-def build_offense_features(skeleton: pl.DataFrame | None = None) -> pl.DataFrame:
+def build_offense_features(skeleton: pl.DataFrame | None = None,
+                           extra_outs: pl.DataFrame | None = None) -> pl.DataFrame:
     """Feature table for all history; pass `skeleton` (identity columns for
     an upcoming week, stats null) to also get prediction-ready rows for
-    that week."""
+    that week. extra_outs adds game-day inactives (see _read_injuries)
+    to the injury and vacated-opportunity features."""
     pw = pl.read_parquet(CURATED_DIR / "player_week.parquet").filter(
         pl.col("season_type") == "REG"
     )
@@ -285,6 +321,14 @@ def build_offense_features(skeleton: pl.DataFrame | None = None) -> pl.DataFrame
         )
     pw = (
         pw.join(snap_pct_table(), on=["season", "week", "player_id"], how="left")
+        .join(player_opportunity(), on=["season", "week", "player_id"], how="left")
+        .with_columns([
+            # a played game with no red-zone work is a 0, not unknown;
+            # skeleton (unplayed) rows stay null so trailing shifts work
+            pl.when(pl.col("fd_points").is_not_null())
+            .then(pl.col(c).fill_null(0.0)).otherwise(None).alias(c)
+            for c in PLAYER_OPP_COLS
+        ])
         .drop("position")
         .rename({"position_group": "position"})
         .sort(["player_id", "season", "week"])
@@ -292,12 +336,12 @@ def build_offense_features(skeleton: pl.DataFrame | None = None) -> pl.DataFrame
             pl.int_range(pl.len()).over(["player_id", "season"]).alias("season_prior_games"),
         )
     )
-    vac_pos, vac_team = vacated_table()
+    vac_pos, vac_team = vacated_table(extra_outs)
     pw = (
         pw.with_columns(trailing_exprs(OFFENSE_TRAILING_COLS))
         .join(depth_rank_table(), on=["season", "week", "player_id"], how="left")
         .join(player_draft_table(), on="player_id", how="left")
-        .join(injury_status_table(), on=["season", "week", "player_id"], how="left")
+        .join(injury_status_table(extra_outs), on=["season", "week", "player_id"], how="left")
         .join(vac_pos.rename({"position_out": "position"}),
               on=["season", "week", "team", "position"], how="left")
         .join(vac_team, on=["season", "week", "team"], how="left")
@@ -339,7 +383,7 @@ def build_dst_features(skeleton: pl.DataFrame | None = None) -> pl.DataFrame:
         )
     )
     dst = dst.with_columns(trailing_exprs(DST_TRAILING_COLS))
-    return _with_opp_and_context(dst, _panel_with_skeleton(skeleton)).sort(
+    return _with_opp_and_context(dst, _panel_with_skeleton(skeleton), dst=True).sort(
         ["season", "week", "team"]
     )
 

@@ -209,3 +209,83 @@ def test_tournament_lineups_differ_and_write(monkeypatch, tmp_path):
 def test_classic_stem_has_no_suffix():
     lu = optimizer.solve_lineup(synthetic_pool())
     assert optimizer.lineup_stem([lu], 2026, 1, "cash").name == "2026_w01_cash"
+
+
+def two_qb_pool() -> pl.DataFrame:
+    """Classic pool where team AAA lists a starter and a backup QB."""
+    pool = synthetic_pool().with_columns(pl.lit(None, dtype=pl.Int32).alias("depth_rank"))
+    backup = pool.filter(pl.col("fd_name") == "AAA QB0").with_columns(
+        pl.lit("AAA QB1").alias("fd_name"), pl.lit(3000, dtype=pl.Int64).alias("salary"),
+        pl.lit(30.0).alias("projection"), pl.lit(25.0).alias("p10"),
+        pl.lit(36.0).alias("p90"), pl.lit(2, dtype=pl.Int32).alias("depth_rank"))
+    starter = pl.when(pl.col("fd_name") == "AAA QB0").then(1).otherwise(None)
+    return pl.concat([pool.with_columns(starter.cast(pl.Int32).alias("depth_rank")),
+                      backup])
+
+
+def test_backup_qb_by_depth_rank():
+    dropped = optimizer.backup_qbs(two_qb_pool())["fd_name"].to_list()
+    assert dropped == ["AAA QB1"]
+
+
+def test_backup_qb_by_salary_when_no_depth_data():
+    pool = two_qb_pool().with_columns(pl.lit(None, dtype=pl.Int32).alias("depth_rank"))
+    dropped = optimizer.backup_qbs(pool)["fd_name"].to_list()
+    assert dropped == ["AAA QB1"]  # $3,000 vs the starter's higher salary
+
+
+def test_backup_qb_without_depth_column():
+    dropped = optimizer.backup_qbs(two_qb_pool().drop("depth_rank"))["fd_name"].to_list()
+    assert dropped == ["AAA QB1"]
+
+
+def test_load_pool_drops_backup_unless_locked_or_allowed(tmp_path, capsys):
+    sheet = tmp_path / "2026_w01_slate1.csv"
+    two_qb_pool().with_columns(
+        pl.lit("ok").alias("confidence"),
+        pl.format("1-{}", pl.int_range(pl.len())).alias("fanduel_id"),
+    ).write_csv(sheet)
+    names = optimizer.load_pool(2026, 1, sheet)["fd_name"].to_list()
+    assert "AAA QB1" not in names and "AAA QB0" in names
+    assert "skipping 1 backup QB(s): AAA QB1 (AAA)" in capsys.readouterr().out
+    kept = optimizer.load_pool(2026, 1, sheet, keep=["AAA QB1"])["fd_name"].to_list()
+    assert "AAA QB1" in kept
+    allowed = optimizer.load_pool(2026, 1, sheet, allow_backup_qb=True)["fd_name"].to_list()
+    assert "AAA QB1" in allowed
+
+
+def test_generate_skips_juicy_backup(tmp_path):
+    sheet = tmp_path / "2026_w01_slate1.csv"
+    two_qb_pool().with_columns(
+        pl.lit("ok").alias("confidence"),
+        pl.format("1-{}", pl.int_range(pl.len())).alias("fanduel_id"),
+    ).write_csv(sheet)
+    (lu,) = optimizer.generate(2026, 1, "gpp", 1, min_diff=1, locks=[], excludes=[],
+                               stack=False, allow_dst_conflict=False, slate_path=sheet)
+    assert "AAA QB1" not in lu["fd_name"].to_list()
+
+
+def test_questionable_starter_still_blocks_backup_in_cash(tmp_path):
+    """safe_only removes the Q starter, but the backup must not be
+    promoted: if the starter suits up, the backup scores nothing."""
+    sheet = tmp_path / "2026_w01_slate1.csv"
+    two_qb_pool().with_columns(
+        pl.lit("ok").alias("confidence"),
+        pl.format("1-{}", pl.int_range(pl.len())).alias("fanduel_id"),
+        pl.when(pl.col("fd_name") == "AAA QB0").then(pl.lit("Q"))
+        .otherwise(pl.col("injury")).alias("injury"),
+    ).write_csv(sheet)
+    names = optimizer.load_pool(2026, 1, sheet, safe_only=True)["fd_name"].to_list()
+    assert "AAA QB0" not in names and "AAA QB1" not in names
+
+
+def test_out_starter_promotes_backup(tmp_path):
+    sheet = tmp_path / "2026_w01_slate1.csv"
+    two_qb_pool().with_columns(
+        pl.lit("ok").alias("confidence"),
+        pl.format("1-{}", pl.int_range(pl.len())).alias("fanduel_id"),
+        pl.when(pl.col("fd_name") == "AAA QB0").then(pl.lit("O"))
+        .otherwise(pl.col("injury")).alias("injury"),
+    ).write_csv(sheet)
+    names = optimizer.load_pool(2026, 1, sheet)["fd_name"].to_list()
+    assert "AAA QB0" not in names and "AAA QB1" in names

@@ -51,6 +51,55 @@ Optimizing for upside: sort by `p90` (or filter high `cv` + positive
 `skew`). Optimizing for stability: maximize `p10`, prefer low `cv`.
 Scorecards append to `outputs/accuracy_log.csv`.
 
+### What the models see
+
+Per-position LightGBM over the feature store (`dfs_nfl.features`), every
+input knowable before kickoff:
+
+- **Trailing production** — EWMA (half-life 4 games) and last-4 means of
+  FanDuel points and every box-score stat, plus snap share, target share,
+  air-yards share and WOPR; volatility (8-game std) and recent max.
+- **Opportunity** (`dfs_nfl.pbp_features`, from play-by-play) — red-zone
+  and inside-10 targets, goal-line (≤5) and red-zone carries, the
+  player's share of his team's red-zone targets / goal-line carries, and
+  **expected touchdowns**: every target, carry and pass attempt credited
+  the league TD rate for its yardline bucket (rates from prior seasons
+  only). Trailing expected TDs are a steadier read on scoring chances
+  than trailing actual TDs.
+- **Team context** (play-by-play) — own offense's trailing plays per
+  game, dropback rate, pass rate over expected in neutral script, and
+  EPA per play; the opponent defense's trailing EPA allowed per dropback
+  and per rush, and success rate allowed. For DST the roles flip (own
+  defense, opponent offense). These rank in the top 15 features at every
+  position.
+- **Game context** — Vegas implied totals and edge, home/away, rest,
+  divisional, dome, forecast temperature and wind.
+- **Availability** — depth-chart rank, injury report status and practice
+  participation, opportunity vacated by teammates ruled out, draft
+  capital and rookie flag.
+- **Stacked baselines** — the B1/B2 naive projections as inputs.
+
+**Loss and blend.** The mean model trains with a huber objective
+(delta 4 points): fantasy points are right-skewed and L2 spent the trees
+chasing boom weeks. The shipped projection is 0.8 × model + 0.2 × B2.
+Both were chosen on the 2024–25 walk-forward backtest
+(`uv run python -m dfs_nfl.experiments [variant ...]` runs the grid —
+residual-over-baseline target, recency-weighted rows, huber / tweedie
+loss, early-stopped rounds — and writes `outputs/experiments.csv`;
+`models.MODEL_SPEC` picks the production variant). Huber won at every
+position; residual targets, recency weights and early stopping were
+neutral or worse. Shipped-projection MAE / within-week Spearman, before
+(L2, box-score features only) and after (huber, play-by-play features,
+0.8 blend):
+
+| | QB | RB | WR | TE | DST |
+|---|---|---|---|---|---|
+| before | 6.50 / 0.515 | 4.21 / 0.728 | 4.06 / 0.645 | 3.12 / 0.596 | 4.14 / 0.293 |
+| after | 6.28 / 0.525 | 4.08 / 0.730 | 3.91 / 0.651 | 3.00 / 0.606 | 4.10 / 0.300 |
+
+Quantile calibration is unchanged (p10 / p90 coverage within a point of
+nominal at every position).
+
 ## Salary value sheets
 
 Drop FanDuel "players list" CSV exports (lobby → download players list)
@@ -82,7 +131,12 @@ default, excludes Q-tagged and cold-start players (`--allow-risky` to
 override); `--mode gpp` maximizes 0.5·projection + 0.5·p90 (add
 `--stack` to force a QB + pass-catcher stack). O/IR/D/NA players are always
 excluded, and lineups never roster offense against their own DST
-(`--allow-dst-conflict` to permit). `--n N --min-diff K` generates N
+(`--allow-dst-conflict` to permit). Backup QBs are dropped too: per team
+only the top depth-chart QB (the value sheet's `depth_rank` = 1, or the
+highest-salaried QB when the chart is missing) is eligible, because the
+model projects a benched QB off his earlier starts and he shows up as a
+fake value play. `--allow-backup-qb` keeps them; a `--lock` on a backup
+always wins. `--n N --min-diff K` generates N
 lineups each differing by ≥K players. `--max-exposure 0.5` keeps any one
 player out of more than half the lineups (locked players exempt). Lineup totals report a range of
 proj ± 1.28·√(Σsd²) — per-player p10/p90 don't sum.
@@ -115,6 +169,16 @@ slate CSV of the target week in `data/raw/fanduel/` (matched by the date
 in the export's filename): full-slate exports get the classic cash/GPP
 builds, single-game exports get the tournament builds. The only manual
 step each week is downloading those CSVs from the FanDuel lobby.
+
+Single-game slates are **re-projected at slate time**: the injury report
+and depth chart are refreshed, the slate's own O/IR/D/NA tags are
+applied as "Out" (FanDuel's game-day inactive tag is the only pre-kickoff
+record of a Monday-night scratch; nflverse's report stops at Friday), and
+just the two teams are projected into
+`outputs/projections/{season}_w{week:02d}_slate{id}.csv`. The week's
+main projection file is untouched, so the scorecard keeps grading the
+Sunday-morning call. With Nacua tagged inactive for the week 2 Monday
+game, Davante Adams moved from 9.6 to 13.0 projected.
 
 How many lineups the automated run builds is set in `config.toml`
 (`[lineups]`: `cash`, `gpp`, `gpp_stack`, `min_diff`, `max_exposure` for

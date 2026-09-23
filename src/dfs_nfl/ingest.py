@@ -17,19 +17,38 @@ import polars as pl
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RAW_DIR = REPO_ROOT / "data" / "raw"
 
-# PBP is only needed for DST points-allowed reconstruction; keep the slim
-# column set so 10 seasons stay small on disk.
+# PBP columns: DST points-allowed reconstruction, plus the play-level
+# fields behind the opportunity features (red-zone / goal-line usage,
+# expected TDs), team pace/pass rate and opponent split-EPA allowed.
+# Columns missing from an older season are simply skipped.
 PBP_COLS = [
     "game_id", "season", "week", "season_type", "posteam", "defteam",
     "play_type", "touchdown", "td_team", "return_touchdown",
     "field_goal_result", "extra_point_result", "two_point_conv_result",
     "defensive_two_point_conv",
+    # play situation
+    "play_id", "drive", "down", "yardline_100", "goal_to_go",
+    "game_seconds_remaining", "half_seconds_remaining", "wp",
+    # play type / outcome
+    "pass", "rush", "qb_dropback", "qb_kneel", "qb_spike", "sack",
+    "pass_attempt", "rush_attempt", "complete_pass", "interception",
+    "fumble_lost", "two_point_attempt", "pass_touchdown", "rush_touchdown",
+    "air_yards", "yards_gained", "epa", "success", "xpass", "pass_oe",
+    # who
+    "passer_player_id", "rusher_player_id", "receiver_player_id",
+    "td_player_id",
 ]
+
+
+def load_pbp(year: int) -> pl.DataFrame:
+    df = nfl.load_pbp([year])
+    return df.select([c for c in PBP_COLS if c in df.columns])
+
 
 SOURCES = {
     "player_stats": lambda yr: nfl.load_player_stats([yr]),
     "team_stats": lambda yr: nfl.load_team_stats([yr]),
-    "pbp": lambda yr: nfl.load_pbp([yr]).select(PBP_COLS),
+    "pbp": load_pbp,
     "snap_counts": lambda yr: nfl.load_snap_counts([yr]),
     "depth_charts": lambda yr: load_depth_charts_normalized(yr),
     "injuries": lambda yr: nfl.load_injuries([yr]).select(

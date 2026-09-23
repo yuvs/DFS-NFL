@@ -34,6 +34,10 @@ Usage:
     --exclude "Name" ...   force players out (repeatable)
     --stack                require a WR/TE teammate with your QB (GPP staple)
     --allow-dst-conflict   permit offensive players facing your own DST
+    --allow-backup-qb      keep non-starting QBs in the pool (by default
+                           only each team's top depth-chart QB — or its
+                           highest-salaried QB when the chart is missing —
+                           is eligible; locked QBs are always kept)
     --slate PATH           value-sheet CSV (default: newest for the week)
     --format auto|classic|tournament
                            roster format; auto (default) detects it from
@@ -98,10 +102,31 @@ def resolve_format(pool: pl.DataFrame, fmt: str = "auto") -> str:
 MODE_WEIGHTS = {"cash": ("p10", 0.5), "gpp": ("p90", 0.5), "mean": (None, 0.0)}
 
 
+def _name_key(name: str) -> str:
+    return re.sub(r"[^a-z]", "", name.lower())
+
+
+def backup_qbs(pool: pl.DataFrame) -> pl.DataFrame:
+    """QBs who aren't their team's starter: per team, the starter is the
+    best depth_rank (1 = top of the chart), with salary breaking ties or
+    standing in when the sheet has no depth data — FanDuel prices the
+    expected starter highest. The model projects backups off their
+    earlier starts, so left in they look like value plays."""
+    qbs = pool.filter(pl.col("position") == "QB")
+    if "depth_rank" not in qbs.columns:
+        qbs = qbs.with_columns(pl.lit(None, dtype=pl.Int32).alias("depth_rank"))
+    ranked = qbs.sort(["team", "depth_rank", "salary"],
+                      descending=[False, False, True], nulls_last=True)
+    # first row per team is the starter; everyone after him is a backup
+    return ranked.filter(pl.col("team") == pl.col("team").shift(1))
+
+
 def load_pool(season: int, week: int, slate_path: Path | None,
-              safe_only: bool = False) -> pl.DataFrame:
+              safe_only: bool = False, allow_backup_qb: bool = False,
+              keep: list[str] | None = None) -> pl.DataFrame:
     """safe_only additionally drops Q-tagged and cold-start players —
-    the cash-mode default, since their floors are unknowable."""
+    the cash-mode default, since their floors are unknowable. Backup QBs
+    are dropped unless allow_backup_qb; names in keep (locks) survive."""
     if slate_path is None:
         # newest sheet by mtime — slate IDs aren't chronological
         candidates = sorted(VALUE_DIR.glob(f"{season}_w{week:02d}_slate*.csv"),
@@ -124,6 +149,21 @@ def load_pool(season: int, week: int, slate_path: Path | None,
             pl.col("mvp_salary")
             .fill_null((pl.col("salary") * 1.5).cast(pl.Int64))
         )
+    # backups go before the cash safety filter: a Q-tagged starter still
+    # blocks his backup (if the starter plays, the backup scores nothing),
+    # whereas an O/IR/D/NA starter was already removed above and does
+    # promote him
+    if not allow_backup_qb:
+        keep_keys = {_name_key(n) for n in keep or ()}
+        drop = [r for r in backup_qbs(pool).to_dicts()
+                if _name_key(r["fd_name"]) not in keep_keys]
+        if drop:
+            shown = [f"{r['fd_name']} ({r['team']})" for r in drop[:6]]
+            more = f", +{len(drop) - 6} more" if len(drop) > 6 else ""
+            print(f"skipping {len(drop)} backup QB(s): {', '.join(shown)}{more}")
+            pool = pool.filter(~pl.col("fanduel_id").is_in([r["fanduel_id"] for r in drop])
+                               if "fanduel_id" in pool.columns else
+                               ~pl.col("fd_name").is_in([r["fd_name"] for r in drop]))
     if safe_only:
         pool = pool.filter(
             (pl.col("injury").is_null() | (pl.col("injury") != "Q"))
@@ -297,7 +337,8 @@ def generate(season: int, week: int, mode: str, n: int, min_diff: int,
              allow_dst_conflict: bool, slate_path: Path | None,
              allow_risky: bool = False,
              max_exposure: float = 1.0,
-             fmt: str = "auto") -> list[pl.DataFrame]:
+             fmt: str = "auto",
+             allow_backup_qb: bool = False) -> list[pl.DataFrame]:
     """max_exposure caps how many of the n lineups any one player can
     appear in (fraction, 1.0 = no cap; locked players are exempt).
     Applied greedily: once a player hits the cap they're out of the
@@ -307,12 +348,13 @@ def generate(season: int, week: int, mode: str, n: int, min_diff: int,
     # cash lineups are floor plays: Q-tagged and cold-start players are
     # out unless explicitly allowed (locks still work — lock = opt-in)
     safe_only = mode == "cash" and not allow_risky
-    pool = load_pool(season, week, slate_path, safe_only=safe_only)
+    pool = load_pool(season, week, slate_path, safe_only=safe_only,
+                     allow_backup_qb=allow_backup_qb, keep=locks)
     resolve_format(pool, fmt)
     if not 0 < max_exposure <= 1:
         raise ValueError(f"max_exposure must be in (0, 1]: {max_exposure}")
     cap = max(1, int(max_exposure * n + 1e-9))
-    lock_keys = {re.sub(r"[^a-z]", "", name.lower()) for name in locks}
+    lock_keys = {_name_key(name) for name in locks}
     lineups, banned, capped = [], [], set()
     appearances: dict[int, int] = {}
     for _ in range(n):
@@ -414,6 +456,8 @@ def main() -> None:
     ap.add_argument("--allow-dst-conflict", action="store_true")
     ap.add_argument("--allow-risky", action="store_true",
                     help="let cash mode roster Q-tagged / cold-start players")
+    ap.add_argument("--allow-backup-qb", action="store_true",
+                    help="keep non-starting QBs in the pool")
     ap.add_argument("--slate", type=Path, default=None)
     ap.add_argument("--max-exposure", type=float, default=1.0,
                     help="max share of the N lineups any player may appear in "
@@ -427,7 +471,8 @@ def main() -> None:
                        args.lock, args.exclude, args.stack,
                        args.allow_dst_conflict, args.slate,
                        allow_risky=args.allow_risky,
-                       max_exposure=args.max_exposure, fmt=args.format)
+                       max_exposure=args.max_exposure, fmt=args.format,
+                       allow_backup_qb=args.allow_backup_qb)
     if not lineups:
         raise SystemExit("no feasible lineup — loosen constraints")
 
