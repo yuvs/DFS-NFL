@@ -49,7 +49,30 @@ per player/DST. Columns:
 
 Optimizing for upside: sort by `p90` (or filter high `cv` + positive
 `skew`). Optimizing for stability: maximize `p10`, prefer low `cv`.
-Scorecards append to `outputs/accuracy_log.csv`.
+Scorecards append to `outputs/accuracy_log.csv`: per-position MAE,
+RMSE, within-week Spearman, p10/p90 coverage, and `top5_hit` — the share
+of the projected top 5 that finished in the actual top 10, the DFS
+question the error metrics don't ask. The backtest reports the same
+(`*_top5` columns in `outputs/model_backtest.csv`).
+
+### Lineup scorecard
+
+The same Tuesday job grades every lineup built for the week
+(`outputs/lineups/`) on actual points and appends to
+`outputs/lineup_log.csv`, with two references built from the same value
+sheet under the same roster rules:
+
+- `hindsight_max` — the lineup that maximizes *actual* points: the
+  ceiling for that slate. `captured` = actual / hindsight_max.
+- `fppg_lineup` — actual points of the lineup optimized on FanDuel's own
+  FPPG column (their trailing average, shown in the lobby): the public
+  baseline the model has to beat.
+
+`players_out` counts rostered players with no stat line (inactive).
+FanDuel doesn't publish salary history, so this is a live backtest that
+accumulates from the saved slates; the classic cash lineup beat the
+FPPG lineup by 54 and 39 points in weeks 1 and 2 of 2026, while the
+week 2 Monday-night builds were the one clear miss (Dart left injured).
 
 ### What the models see
 

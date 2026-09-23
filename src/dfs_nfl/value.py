@@ -82,6 +82,7 @@ def load_slate(path: Path) -> pl.DataFrame:
         pl.col("Team").replace(TEAM_FIX).alias("team"),
         pl.col("Salary").cast(pl.Int64).alias("salary"),
         mvp_salary.alias("mvp_salary"),
+        pl.col("FPPG").cast(pl.Float64, strict=False).alias("fppg"),
         pl.col("Injury Indicator").alias("injury"),
         pl.col("Roster Position").alias("roster_position"),
     )
@@ -125,8 +126,8 @@ def match_slate(slate: pl.DataFrame, proj: pl.DataFrame) -> tuple[pl.DataFrame, 
     matched3 = m3.filter(pl.col("projection").is_not_null())
     unmatched = m3.filter(pl.col("projection").is_null()).select(players.columns)
 
-    keep = ["fanduel_id", "fd_name", "position", "team", "salary", "mvp_salary", "injury",
-            "roster_position", "player_id", "name", "opponent_team",
+    keep = ["fanduel_id", "fd_name", "position", "team", "salary", "mvp_salary", "fppg",
+            "injury", "roster_position", "player_id", "name", "opponent_team",
             "projection", "p10", "p50", "p90", "sd", "cv", "skew",
             "team_implied_total", "opp_implied_total", "confidence",
             "depth_rank"]

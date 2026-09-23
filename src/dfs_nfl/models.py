@@ -236,19 +236,37 @@ def backtest_position(pos: str, baselines: pl.DataFrame) -> tuple[pl.DataFrame, 
     return pl.concat(preds), imp
 
 
+TOP_N, TOP_M = 5, 10
+
+
+def top_hit_rate(pred, actual, n: int = TOP_N, m: int = TOP_M) -> float | None:
+    """Share of the top-n by prediction that finished in the actual top-m
+    (PLAN.md §4): the DFS question — did the model's favourites land?"""
+    pred, actual = np.asarray(pred, dtype=float), np.asarray(actual, dtype=float)
+    if len(pred) < max(n, m):
+        return None
+    picked = np.argsort(-pred, kind="stable")[:n]
+    real = set(np.argsort(-actual, kind="stable")[:m])
+    return float(np.mean([i in real for i in picked]))
+
+
 def evaluate(matched: pl.DataFrame) -> dict:
     row = {"n": matched.height}
     for name in ["final", "model", "b1", "b2"]:
         err = matched[f"pred_{name}"] - matched["fd_points"]
         row[f"{name}_mae"] = round(float(err.abs().mean()), 3)
         row[f"{name}_rmse"] = round(float((err ** 2).mean() ** 0.5), 3)
-        corrs = []
+        corrs, hits = [], []
         for _, wk in matched.group_by(["season", "week"]):
             if wk.height >= 8:
                 r = spearmanr(wk[f"pred_{name}"], wk["fd_points"]).statistic
                 if r == r:
                     corrs.append(r)
+            h = top_hit_rate(wk[f"pred_{name}"], wk["fd_points"])
+            if h is not None:
+                hits.append(h)
         row[f"{name}_spearman"] = round(sum(corrs) / len(corrs), 3) if corrs else None
+        row[f"{name}_top5"] = round(sum(hits) / len(hits), 3) if hits else None
     return row
 
 
