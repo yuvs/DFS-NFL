@@ -123,6 +123,32 @@ neutral or worse. Shipped-projection MAE / within-week Spearman, before
 Quantile calibration is unchanged (p10 / p90 coverage within a point of
 nominal at every position).
 
+**Vegas anchor.** Vegas implied team totals are well calibrated
+(2016–25: actual points ≈ 1.02 × implied, bias +0.2), and where the
+model's team total disagrees with Vegas, actual scoring barely follows
+the model. So after the blend, each week's offense projections are
+summed per team and regressed on implied totals across that week's
+teams. Every player on a team is then scaled to close 75%
+(`models.VEGAS_ANCHOR`) of the team's gap to that line, with the factor
+clipped to 0.75–1.25. Doubtful/Out players don't count toward team sums;
+p10/p50/p90 move with the projection; DST is untouched. The factor is
+written to the `anchor_factor` column. The line is fit on the same
+week's projections, so it uses no outcomes. A full-week run saves it to
+`outputs/projections/{season}_w{week:02d}_anchor.json`, and single-game
+re-projections (too few teams to fit) reuse it or skip the anchor if
+it's missing. 0.75 was picked on 2024 and held on 2025; walk-forward
+2024–25, MAE / Spearman / top-5 hit (`blend_*` vs `final_*` in
+`outputs/model_backtest.csv`):
+
+| | QB | RB | WR | TE |
+|---|---|---|---|---|
+| blend | 6.28 / 0.525 / 0.506 | 4.08 / 0.730 / 0.483 | 3.91 / 0.651 / 0.328 | 3.00 / 0.606 / 0.478 |
+| anchored | 6.20 / 0.540 / 0.506 | 4.06 / 0.736 / 0.500 | 3.90 / 0.656 / 0.350 | 2.99 / 0.609 / 0.483 |
+
+The same study found no betting edge in the lines themselves: overs hit
+49%, no spread segment reached the 52.4% needed at −110, and the
+apparent primetime/high-wind unders flip season to season.
+
 ## Salary value sheets
 
 Drop FanDuel "players list" CSV exports (lobby → download players list)
@@ -243,7 +269,8 @@ overrides via `dfs_nfl.odds`; without it, nflverse schedule lines are used.
   weather, official injury report status/practice participation, and
   vacated opportunity — trailing FD points of teammates ruled Out/Doubtful)
 - `src/dfs_nfl/models.py` — per-position LightGBM (with stacked baselines
-  as features) blended 60/40 with baseline B2
+  as features) blended 80/20 with baseline B2, then anchored to Vegas
+  team totals
 - `src/dfs_nfl/quantiles.py` — p10/p50/p90 quantile models (calibrated
   within ~0.02 of target coverage on 2024–25)
 - `src/dfs_nfl/coldstart.py` — prior model for players with <2 career

@@ -1,4 +1,5 @@
-"""Per-position LightGBM models, walk-forward backtest vs baselines.
+"""Per-position LightGBM models, walk-forward backtest vs baselines, and
+the team-level Vegas anchor applied after the B2 blend.
 
 For each eval week (season S, week W): train on all REG rows strictly
 before it — earlier seasons plus weeks < W of season S — and predict W.
@@ -65,6 +66,80 @@ BLEND_WEIGHT = 0.8
 # spent the trees chasing boom weeks. Residual-over-B2 targets, recency
 # weights and early stopping were neutral to slightly worse.
 MODEL_SPEC: dict[str, dict] = {"default": {"objective": "huber"}}
+
+# Team-level Vegas anchor, applied after the B2 blend to offense only.
+# Each week, regress team projection sums on Vegas implied totals across
+# that week's teams; a team's distance from the line is mostly noise
+# (actual scoring barely follows it once the implied total is known), so
+# every player on the team is scaled to close VEGAS_ANCHOR of that gap.
+# The line is fit cross-sectionally on the same week's projections, so
+# it needs no outcomes and absorbs the universe's scale (the backtest
+# scores only active >=2-game players; production adds backups and
+# cold-start rookies).
+VEGAS_ANCHOR = 0.75
+ANCHOR_CLIP = (0.75, 1.25)
+ANCHOR_MIN_TEAMS = 8
+# Doubtful/Out players don't count toward team sums (production still
+# projects them; the backtest never sees them)
+ANCHOR_MAX_INJ_STATUS = 1
+OFFENSE = ["QB", "RB", "WR", "TE"]
+
+
+def team_sums(rows: pl.DataFrame, pred: str) -> pl.DataFrame:
+    """(season, week, game_id, team, implied_total, team_proj) over offense
+    rows expected to play. `rows` needs season, week, game_id, team,
+    position, implied_total and `pred`; inj_status is optional."""
+    counted = rows.filter(pl.col("position").is_in(OFFENSE))
+    if "inj_status" in counted.columns:
+        counted = counted.filter(
+            pl.col("inj_status").fill_null(0) <= ANCHOR_MAX_INJ_STATUS)
+    return (counted.group_by("season", "week", "game_id", "team")
+            .agg(pl.col("implied_total").first(), pl.col(pred).sum().alias("team_proj"))
+            .filter(pl.col("implied_total").is_not_null()))
+
+
+def fit_anchor_line(teams: pl.DataFrame) -> tuple[float, float] | None:
+    """OLS team_proj = a + b * implied_total, or None with too few teams
+    (a single-game slate: reuse the full week's line instead)."""
+    if teams.height < ANCHOR_MIN_TEAMS:
+        return None
+    b, a = np.polyfit(teams["implied_total"].to_numpy().astype(float),
+                      teams["team_proj"].to_numpy().astype(float), 1)
+    return float(a), float(b)
+
+
+def anchor_factors(teams: pl.DataFrame, line: tuple[float, float],
+                   lam: float = VEGAS_ANCHOR) -> pl.DataFrame:
+    """(game_id, team, anchor_factor): scale that moves team_proj lam of the
+    way to the line, clipped to ANCHOR_CLIP."""
+    a, b = line
+    target = a + b * pl.col("implied_total")
+    return teams.select(
+        "game_id", "team",
+        (1 - lam * (pl.col("team_proj") - target) / pl.col("team_proj"))
+        .clip(*ANCHOR_CLIP).fill_nan(1.0).alias("anchor_factor"),
+    )
+
+
+def apply_vegas_anchor(rows: pl.DataFrame, pred: str, out: str,
+                       lam: float = VEGAS_ANCHOR) -> pl.DataFrame:
+    """Backtest form: fit the line per (season, week) and write the
+    anchored prediction to `out`. DST rows and weeks with too few teams
+    pass through unchanged."""
+    teams = team_sums(rows, pred)
+    factors = []
+    for _, wk in teams.group_by("season", "week"):
+        line = fit_anchor_line(wk)
+        if line is not None:
+            factors.append(anchor_factors(wk, line, lam))
+    f = (pl.concat(factors) if factors
+         else pl.DataFrame(schema={"game_id": pl.Utf8, "team": pl.Utf8,
+                                   "anchor_factor": pl.Float64}))
+    return (rows.join(f, on=["game_id", "team"], how="left")
+            .with_columns(pl.when(pl.col("position").is_in(OFFENSE))
+                          .then(pl.col(pred) * pl.col("anchor_factor").fill_null(1.0))
+                          .otherwise(pl.col(pred)).alias(out))
+            .drop("anchor_factor"))
 
 
 def model_spec(pos: str) -> dict:
@@ -231,6 +306,9 @@ def backtest_position(pos: str, baselines: pl.DataFrame) -> tuple[pl.DataFrame, 
         importances += trainer.booster.feature_importance(importance_type="gain")
         preds.append(test.select(
             "player_id", "game_id", "season", "week", "position", "fd_points",
+            "team", "implied_total",
+            (pl.col("inj_status") if "inj_status" in test.columns
+             else pl.lit(0)).cast(pl.Int64).alias("inj_status"),
         ).with_columns(pl.Series("pred_model", yhat)))
     imp = pl.DataFrame({"feature": cols, "gain": importances}).sort("gain", descending=True)
     return pl.concat(preds), imp
@@ -252,7 +330,9 @@ def top_hit_rate(pred, actual, n: int = TOP_N, m: int = TOP_M) -> float | None:
 
 def evaluate(matched: pl.DataFrame) -> dict:
     row = {"n": matched.height}
-    for name in ["final", "model", "b1", "b2"]:
+    for name in ["final", "blend", "model", "b1", "b2"]:
+        if f"pred_{name}" not in matched.columns:
+            continue
         err = matched[f"pred_{name}"] - matched["fd_points"]
         row[f"{name}_mae"] = round(float(err.abs().mean()), 3)
         row[f"{name}_rmse"] = round(float((err ** 2).mean() ** 0.5), 3)
@@ -275,23 +355,27 @@ def main() -> None:
     baselines = pl.read_parquet(OUTPUTS_DIR / "baseline_predictions.parquet").select(
         "player_id", "game_id", "pred_b1", "pred_b2",
     )
-    rows, all_preds = [], []
+    all_preds = []
     for pos in POSITIONS:
         preds, imp = backtest_position(pos, baselines)
         imp.write_csv(OUTPUTS_DIR / f"feature_importance_{pos.lower()}.csv")
-        matched = preds.join(baselines, on=["player_id", "game_id"], how="inner").filter(
+        all_preds.append(preds.join(baselines, on=["player_id", "game_id"], how="inner").filter(
             pl.col("pred_b1").is_not_null() & pl.col("pred_b2").is_not_null()
         ).with_columns(
             (BLEND_WEIGHT * pl.col("pred_model")
-             + (1 - BLEND_WEIGHT) * pl.col("pred_b2")).alias("pred_final")
-        )
-        all_preds.append(matched)
-        rows.append({"position": pos} | evaluate(matched))
+             + (1 - BLEND_WEIGHT) * pl.col("pred_b2")).alias("pred_blend")
+        ))
         print(f"{pos}: top features -> "
               + ", ".join(imp["feature"].head(5).to_list()))
+    # the anchor needs every offensive position at once (team sums), so it
+    # runs after the per-position loop; "blend" is the pre-anchor number
+    matched_all = apply_vegas_anchor(pl.concat(all_preds), "pred_blend", "pred_final")
+    rows = [{"position": pos}
+            | evaluate(matched_all.filter(pl.col("position") == pos))
+            for pos in POSITIONS]
     report = pl.DataFrame(rows)
     report.write_csv(OUTPUTS_DIR / "model_backtest.csv")
-    pl.concat(all_preds).write_parquet(OUTPUTS_DIR / "model_predictions.parquet")
+    matched_all.write_parquet(OUTPUTS_DIR / "model_predictions.parquet")
     with pl.Config(tbl_cols=-1, tbl_width_chars=220):
         print(f"\nWalk-forward eval, seasons {EVAL_SEASONS}, REG, "
               f">={MIN_PRIOR_GAMES} prior games, matched rows vs baselines\n")

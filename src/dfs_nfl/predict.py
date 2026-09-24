@@ -22,6 +22,7 @@ Usage: uv run python -m dfs_nfl.predict <season> <week> [--no-refresh]
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -48,8 +49,11 @@ from dfs_nfl.models import (
     POSITION_PARAMS,
     POSITIONS,
     Trainer,
+    anchor_factors,
     feature_columns,
+    fit_anchor_line,
     model_spec,
+    team_sums,
     to_matrix,
 )
 
@@ -325,6 +329,39 @@ def projection_path(season: int, week: int, tag: str = "") -> Path:
     return PROJECTIONS_DIR / f"{season}_w{week:02d}{tag}.parquet"
 
 
+def anchor_line_path(season: int, week: int) -> Path:
+    return PROJECTIONS_DIR / f"{season}_w{week:02d}_anchor.json"
+
+
+def _anchor_to_vegas(preds: pl.DataFrame, season: int, week: int,
+                     teams: list[str] | None) -> pl.DataFrame:
+    """Scale each offense's projections (and quantiles) toward the week's
+    Vegas line (models.VEGAS_ANCHOR). A full-week run fits the line and
+    saves it; a single-game run has too few teams to fit one, so it reuses
+    the saved full-week line, or skips the anchor if there is none."""
+    sums = team_sums(preds, "projection")
+    line = fit_anchor_line(sums)
+    path = anchor_line_path(season, week)
+    if line is not None and teams is None:
+        PROJECTIONS_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"a": line[0], "b": line[1], "teams": sums.height}))
+    elif line is None and path.exists():
+        saved = json.loads(path.read_text())
+        line = (saved["a"], saved["b"])
+    if line is None:
+        print("  vegas anchor: no line for this week (run the full week first); skipped")
+        return preds.with_columns(pl.lit(1.0).alias("anchor_factor"))
+    factors = anchor_factors(sums, line)
+    print(f"  vegas anchor: team proj = {line[0]:.1f} + {line[1]:.2f} x implied; "
+          f"factors {factors['anchor_factor'].min():.2f}-{factors['anchor_factor'].max():.2f}")
+    is_off = pl.col("position").is_in(OFFENSE_POSITIONS)
+    f = pl.when(is_off).then(pl.col("anchor_factor").fill_null(1.0)).otherwise(1.0)
+    return (preds.join(factors, on=["game_id", "team"], how="left")
+            .with_columns(f.alias("anchor_factor"))
+            .with_columns([(pl.col(c) * pl.col("anchor_factor")).alias(c)
+                           for c in ["projection", "p10", "p50", "p90"]]))
+
+
 def predict_week(season: int, week: int, refresh: bool = True,
                  teams: list[str] | None = None, tag: str = "",
                  extra_outs: pl.DataFrame | None = None) -> pl.DataFrame:
@@ -355,7 +392,7 @@ def predict_week(season: int, week: int, refresh: bool = True,
     feats_dst = _apply_weather(build_dst_features(skeleton=skel_dst), season, week)
 
     print("training and predicting...")
-    out = []
+    frames = []
     for pos in POSITIONS:
         feats = feats_dst if pos == "DST" else feats_off.filter(pl.col("position") == pos)
         df = feats.join(base_preds, on=["player_id", "game_id"], how="left")
@@ -368,35 +405,45 @@ def predict_week(season: int, week: int, refresh: bool = True,
             (pl.col("team") + " D/ST").alias("name") if pos == "DST"
             else pl.col("player_display_name").alias("name")
         )
-        # variance metrics derived from the calibrated quantiles:
-        #   sd   ~ (p90-p10)/2.563 (the 10th-90th pct span of a normal)
-        #   cv   = sd / projection — volatility relative to expectation;
-        #          low = stable (cash games), high = volatile (GPP)
-        #   skew = tail asymmetry in [-1, 1]; positive = more room above
-        #          the median than below (boom/bust profile)
-        width = pl.col("p90") - pl.col("p10")
-        variance_exprs = [
-            (width / 2.563).round(2).alias("sd"),
-            pl.when(pl.col("projection") >= 1.0)
-            .then(((width / 2.563) / pl.col("projection")).round(2))
-            .otherwise(None).alias("cv"),
-            pl.when(width > 0.5)
-            .then((((pl.col("p90") - pl.col("p50"))
-                    - (pl.col("p50") - pl.col("p10"))) / width).round(2))
-            .otherwise(None).alias("skew"),
-        ]
-        out.append(preds.select(
+        frames.append(preds.select(
             "season", "week", "game_id", "team", "opponent_team", "position",
-            "player_id", name_expr,
-            pl.col("projection").round(2),
-            "p10", "p50", "p90",
-            *variance_exprs,
-            pl.col("implied_total").round(2).alias("team_implied_total"),
-            pl.col("opp_implied_total").round(2),
-            "prior_games",
-            pl.when(pl.col("prior_games") < MIN_PRIOR_GAMES)
-            .then(pl.lit("low")).otherwise(pl.lit("ok")).alias("confidence"),
+            "player_id", name_expr, "projection", "p10", "p50", "p90",
+            "implied_total", "opp_implied_total", "prior_games",
+            (pl.col("inj_status") if "inj_status" in preds.columns
+             else pl.lit(0)).cast(pl.Int64).alias("inj_status"),
         ))
+    preds = _anchor_to_vegas(pl.concat(frames, how="vertical_relaxed"), season, week, teams)
+
+    # variance metrics derived from the calibrated quantiles:
+    #   sd   ~ (p90-p10)/2.563 (the 10th-90th pct span of a normal)
+    #   cv   = sd / projection — volatility relative to expectation;
+    #          low = stable (cash games), high = volatile (GPP)
+    #   skew = tail asymmetry in [-1, 1]; positive = more room above
+    #          the median than below (boom/bust profile)
+    width = pl.col("p90") - pl.col("p10")
+    variance_exprs = [
+        (width / 2.563).round(2).alias("sd"),
+        pl.when(pl.col("projection") >= 1.0)
+        .then(((width / 2.563) / pl.col("projection")).round(2))
+        .otherwise(None).alias("cv"),
+        pl.when(width > 0.5)
+        .then((((pl.col("p90") - pl.col("p50"))
+                - (pl.col("p50") - pl.col("p10"))) / width).round(2))
+        .otherwise(None).alias("skew"),
+    ]
+    out = [preds.select(
+        "season", "week", "game_id", "team", "opponent_team", "position",
+        "player_id", "name",
+        pl.col("projection").round(2),
+        pl.col("p10").round(2), pl.col("p50").round(2), pl.col("p90").round(2),
+        *variance_exprs,
+        pl.col("implied_total").round(2).alias("team_implied_total"),
+        pl.col("opp_implied_total").round(2),
+        "prior_games",
+        pl.when(pl.col("prior_games") < MIN_PRIOR_GAMES)
+        .then(pl.lit("low")).otherwise(pl.lit("ok")).alias("confidence"),
+        pl.col("anchor_factor").round(3),
+    )]
     projections = pl.concat(out).sort("projection", descending=True)
     PROJECTIONS_DIR.mkdir(parents=True, exist_ok=True)
     stem = projection_path(season, week, tag).with_suffix("")
