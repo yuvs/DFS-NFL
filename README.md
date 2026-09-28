@@ -130,7 +130,11 @@ the model. So after the blend, each week's offense projections are
 summed per team and regressed on implied totals across that week's
 teams. Every player on a team is then scaled to close 75%
 (`models.VEGAS_ANCHOR`) of the team's gap to that line, with the factor
-clipped to 0.75–1.25. Doubtful/Out players don't count toward team sums;
+clipped to 0.75–1.25. Doubtful/Out players don't count toward team sums,
+and only one QB per team does (best depth-chart rank, highest projection
+as tiebreak): production projects every QB on the chart, and a benched
+starter's 10-point projection used to inflate his team's sum and drag
+every teammate down (week 3 2026 CHI and PHI each carried three);
 p10/p50/p90 move with the projection; DST is untouched. The factor is
 written to the `anchor_factor` column. The line is fit on the same
 week's projections, so it uses no outcomes. A full-week run saves it to
@@ -144,6 +148,17 @@ it's missing. 0.75 was picked on 2024 and held on 2025; walk-forward
 |---|---|---|---|---|
 | blend | 6.28 / 0.525 / 0.506 | 4.08 / 0.730 / 0.483 | 3.91 / 0.651 / 0.328 | 3.00 / 0.606 / 0.478 |
 | anchored | 6.20 / 0.540 / 0.506 | 4.06 / 0.736 / 0.500 | 3.90 / 0.656 / 0.350 | 2.99 / 0.609 / 0.483 |
+| starter QB only | 6.28 / 0.527 / 0.506 | 4.06 / 0.736 / 0.489 | 3.90 / 0.656 / 0.344 | 2.99 / 0.610 / 0.467 |
+
+The QB gain in the "anchored" row was partly leakage: the backtest only
+has players who actually played, so a team with two QB rows is usually
+one whose starter left the game hurt, and counting the backup pulled the
+starter's projection down in exactly those games. On the 865 one-QB
+team-games the starter-only rule is neutral (QB MAE 6.23 → 6.25, other
+positions 3.749 → 3.742); the 415 QB rows in two-QB games carry the
+whole difference. The starter-only row is recomputed from
+`outputs/model_predictions.parquet`; `model_backtest.csv` picks it up on
+the next `dfs_nfl.models` run.
 
 The same study found no betting edge in the lines themselves: overs hit
 49%, no spread segment reached the 52.4% needed at −110, and the

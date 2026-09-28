@@ -102,3 +102,36 @@ def test_single_game_without_saved_line_is_unchanged(monkeypatch, tmp_path):
     out = predict._anchor_to_vegas(one_game, 2026, 3, teams=["T0", "T1"])
     assert (out["anchor_factor"] == 1.0).all()
     assert out["projection"].to_list() == one_game["projection"].to_list()
+
+
+def test_only_the_starting_qb_counts():
+    df = _week()
+    backup = df.filter(pl.col("player_id") == "QB0").with_columns(
+        pl.lit("BACKUP0").alias("player_id"), pl.lit(40.0).alias("projection"))
+    starter_total = 20 + 2 * 17
+    # no depth chart: the highest-projected QB is taken as the starter
+    sums = models.team_sums(pl.concat([df, backup]), "projection")
+    t0 = sums.filter(pl.col("team") == "T0")["team_proj"][0]
+    assert t0 == pytest.approx(starter_total - 0.6 * starter_total + 40)
+    # with ranks, depth chart wins over projection
+    ranked = pl.concat([
+        df.with_columns(pl.lit(1, dtype=pl.Int32).alias("depth_rank")),
+        backup.with_columns(pl.lit(2, dtype=pl.Int32).alias("depth_rank")),
+    ])
+    sums = models.team_sums(ranked, "projection")
+    assert sums.filter(pl.col("team") == "T0")["team_proj"][0] == pytest.approx(starter_total)
+    assert sums.height == 10
+
+
+def test_out_starter_hands_the_count_to_the_next_qb():
+    df = _week().with_columns(pl.lit(1, dtype=pl.Int32).alias("depth_rank"))
+    starter = df.filter(pl.col("player_id") == "QB0")
+    backup = starter.with_columns(pl.lit("BACKUP0").alias("player_id"),
+                                  pl.lit(2, dtype=pl.Int32).alias("depth_rank"),
+                                  pl.lit(5.0).alias("projection"))
+    out = pl.concat([df.filter(pl.col("player_id") != "QB0"),
+                     starter.with_columns(pl.lit(3, dtype=pl.Int64).alias("inj_status")),
+                     backup])
+    sums = models.team_sums(out, "projection")
+    assert sums.filter(pl.col("team") == "T0")["team_proj"][0] == pytest.approx(
+        0.4 * (20 + 2 * 17) + 5.0)

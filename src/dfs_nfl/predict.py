@@ -411,6 +411,9 @@ def predict_week(season: int, week: int, refresh: bool = True,
             "implied_total", "opp_implied_total", "prior_games",
             (pl.col("inj_status") if "inj_status" in preds.columns
              else pl.lit(0)).cast(pl.Int64).alias("inj_status"),
+            # the anchor counts only each team's top-ranked QB
+            (pl.col("depth_rank") if "depth_rank" in preds.columns
+             else pl.lit(None)).cast(pl.Int32).alias("depth_rank"),
         ))
     preds = _anchor_to_vegas(pl.concat(frames, how="vertical_relaxed"), season, week, teams)
 

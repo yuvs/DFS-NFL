@@ -85,14 +85,32 @@ ANCHOR_MAX_INJ_STATUS = 1
 OFFENSE = ["QB", "RB", "WR", "TE"]
 
 
+def starting_qbs(rows: pl.DataFrame, pred: str) -> pl.DataFrame:
+    """One QB row per team: best depth_rank when the column is there,
+    highest `pred` as tiebreak (and as the whole rule without it)."""
+    qbs = rows.filter(pl.col("position") == "QB")
+    by, desc = [pred], [True]
+    if "depth_rank" in qbs.columns:
+        by, desc = ["depth_rank", pred], [False, True]
+    return (qbs.sort(by, descending=desc, nulls_last=True)
+            .unique(subset=["season", "week", "game_id", "team"],
+                    keep="first", maintain_order=True))
+
+
 def team_sums(rows: pl.DataFrame, pred: str) -> pl.DataFrame:
     """(season, week, game_id, team, implied_total, team_proj) over offense
     rows expected to play. `rows` needs season, week, game_id, team,
-    position, implied_total and `pred`; inj_status is optional."""
+    position, implied_total and `pred`; inj_status and depth_rank are
+    optional. Only the starting QB counts: production projects every QB
+    on the depth chart, and backups (a benched starter carries 10+ pts
+    off his earlier starts) would inflate the team sum and drag every
+    teammate's factor down."""
     counted = rows.filter(pl.col("position").is_in(OFFENSE))
     if "inj_status" in counted.columns:
         counted = counted.filter(
             pl.col("inj_status").fill_null(0) <= ANCHOR_MAX_INJ_STATUS)
+    counted = pl.concat([counted.filter(pl.col("position") != "QB"),
+                         starting_qbs(counted, pred)])
     return (counted.group_by("season", "week", "game_id", "team")
             .agg(pl.col("implied_total").first(), pl.col(pred).sum().alias("team_proj"))
             .filter(pl.col("implied_total").is_not_null()))
