@@ -216,8 +216,11 @@ slate-specific, so regenerate after downloading a new players list.
 `weekly` also auto-builds a value sheet and lineups for every FanDuel
 slate CSV of the target week in `data/raw/fanduel/` (matched by the date
 in the export's filename): full-slate exports get the classic cash/GPP
-builds, single-game exports get the tournament builds. The only manual
-step each week is downloading those CSVs from the FanDuel lobby.
+builds, single-game exports get the tournament builds. A slate whose
+first game has already kicked off is skipped, so the Sunday run doesn't
+overwrite Thursday's lineups (the ones you entered, which the lineup
+scorecard grades). The only manual step each week is downloading those
+CSVs from the FanDuel lobby.
 
 Single-game slates are **re-projected at slate time**: the injury report
 and depth chart are refreshed, the slate's own O/IR/D/NA tags are

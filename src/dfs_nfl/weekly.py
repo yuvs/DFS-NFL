@@ -21,6 +21,9 @@ and Sunday 10am ET — see README.
 
 from __future__ import annotations
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import polars as pl
 
 from dfs_nfl.features import RAW_DIR
@@ -56,6 +59,38 @@ def week_slate_files(season: int, week: int) -> list:
         if slate_date(f) in game_days:
             newest[slate_id(f)] = f
     return sorted(newest.values(), key=lambda p: p.stat().st_mtime)
+
+
+# nflverse gameday/gametime are US Eastern
+KICKOFF_TZ = ZoneInfo("America/New_York")
+
+
+def slate_first_kickoff(season: int, week: int, teams: list[str]) -> datetime | None:
+    """Earliest scheduled kickoff among the week's games involving the
+    slate's teams, or None if none of them are on the schedule."""
+    games = pl.read_parquet(RAW_DIR / "schedules.parquet").filter(
+        (pl.col("season") == season) & (pl.col("week") == week)
+        & (pl.col("home_team").is_in(teams) | pl.col("away_team").is_in(teams))
+        & pl.col("gametime").is_not_null()
+    )
+    if not games.height:
+        return None
+    return min(
+        datetime.strptime(f"{d} {t}", "%Y-%m-%d %H:%M").replace(tzinfo=KICKOFF_TZ)
+        for d, t in games.select("gameday", "gametime").rows()
+    )
+
+
+def slate_started(season: int, week: int, teams: list[str],
+                  now: datetime | None = None) -> bool:
+    """True once the slate's first game has kicked off. Lineups for it
+    can no longer be entered, and rebuilding would overwrite the files
+    the lineup scorecard grades. Unknown teams never count as started."""
+    kickoff = slate_first_kickoff(season, week, teams)
+    if kickoff is None:
+        print(f"  no scheduled games found for {teams}; building anyway")
+        return False
+    return (now or datetime.now(KICKOFF_TZ)) >= kickoff
 
 
 def week_slate_file(season: int, week: int):
@@ -131,6 +166,11 @@ def build_slate_outputs(season: int, week: int) -> None:
     for slate in slates:
         raw = load_slate(slate)
         fmt = "tournament" if is_tournament(raw) else "classic"
+        teams = sorted(raw["team"].unique().to_list())
+        if slate_started(season, week, teams):
+            print(f"{slate.name}: {fmt} slate already started; skipped "
+                  "(existing value sheet and lineups kept)")
+            continue
         print(f"{slate.name}: {fmt} slate")
         proj = None
         if fmt == "tournament":
