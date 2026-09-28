@@ -44,6 +44,7 @@ from dfs_nfl.models import (  # noqa: F401 - re-exported for tests/callers
     sample_weights,
     variant_params,
 )
+from dfs_nfl.pbp_features import QB_SKILL_COLS
 
 VARIANTS: dict[str, dict] = {
     "base": {},
@@ -55,6 +56,10 @@ VARIANTS: dict[str, dict] = {
     "tweedie_decay": {"objective": "tweedie", "decay": 3.0},
     "early": {"early_stop": True},
     "resid_decay_early": {"residual": True, "decay": 3.0, "early_stop": True},
+    # production spec plus the starting-QB skill features: built into the
+    # feature store but kept out of production (2026-09 A/B: MAE a hair
+    # better, top-5 hit a hair worse, all within week-bootstrap noise)
+    "huber_qb": {"objective": "huber", "extra_features": QB_SKILL_COLS},
 }
 
 
@@ -67,7 +72,7 @@ def backtest_variant(name: str, spec: dict, baselines: pl.DataFrame) -> list[dic
             .join(baselines, on=["player_id", "game_id"], how="left")
             .sort(["season", "week", "game_id", "player_id"])
         )
-        cols = feature_columns(df)
+        cols = feature_columns(df) + spec.get("extra_features", [])
         trainer = Trainer(pos, spec)
         eval_weeks = (
             df.filter(pl.col("season").is_in(EVAL_SEASONS))

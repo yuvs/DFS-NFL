@@ -25,7 +25,13 @@ from dfs_nfl.baselines import (
 )
 from dfs_nfl.pbp_features import (
     PLAYER_OPP_COLS,
+    QB_SKILL_COLS,
+    _team_week_grid,
+    incumbent_ratings,
     player_opportunity,
+    primary_passers,
+    qb_game_table,
+    qb_ratings,
     team_context_tables,
 )
 
@@ -139,6 +145,70 @@ def depth_rank_table() -> pl.DataFrame:
         .group_by(["season", "week", "gsis_id"])
         .agg(pl.col("depth_rank").min())
         .rename({"gsis_id": "player_id"})
+    )
+
+
+def qb_depth_table() -> pl.DataFrame:
+    """(season, week, team, qb_id, depth_rank) for QBs on each week's chart."""
+    files = sorted((RAW_DIR / "depth_charts").glob("*.parquet"))
+    dc = pl.concat([pl.read_parquet(f) for f in files], how="vertical_relaxed")
+    return (
+        dc.filter(pl.col("position") == "QB")
+        .group_by(["season", "week", "team", pl.col("gsis_id").alias("qb_id")])
+        .agg(pl.col("depth_rank").min())
+        .with_columns(pl.col("season").cast(pl.Int32), pl.col("week").cast(pl.Int32))
+    )
+
+
+def expected_starters(games: pl.DataFrame,
+                      extra_outs: pl.DataFrame | None = None) -> pl.DataFrame:
+    """(season, week, team, qb_id): the best-ranked QB on that week's depth
+    chart who isn't ruled Doubtful/Out; weeks without a usable chart fall
+    back to the passer with the most dropbacks in the team's last game."""
+    grid = _team_week_grid()
+    outs = injury_status_table(extra_outs).filter(pl.col("inj_status") >= 2).select(
+        "season", "week", pl.col("player_id").alias("qb_id"))
+    chart = (
+        qb_depth_table()
+        .join(outs, on=["season", "week", "qb_id"], how="anti")
+        .sort("depth_rank")
+        .unique(subset=["season", "week", "team"], keep="first", maintain_order=True)
+        .select("season", "week", "team", "qb_id")
+    )
+    last = primary_passers(games).with_columns(
+        ((pl.col("season") - 2010) * 25 + pl.col("week")).alias("g_idx")).sort("g_idx")
+    fallback = (
+        grid.with_columns(((pl.col("season") - 2010) * 25 + pl.col("week") - 1).alias("g_idx"))
+        .sort("g_idx")
+        .join_asof(last.select("team", "g_idx", "qb_id"), on="g_idx", by="team",
+                   strategy="backward")
+        .select("season", "week", "team", pl.col("qb_id").alias("fb_id"))
+    )
+    return (
+        grid.join(chart, on=["season", "week", "team"], how="left")
+        .join(fallback, on=["season", "week", "team"], how="left")
+        .select("season", "week", "team",
+                pl.coalesce("qb_id", "fb_id").alias("qb_id"))
+        .filter(pl.col("qb_id").is_not_null())
+    )
+
+
+def qb_skill_table(extra_outs: pl.DataFrame | None = None) -> pl.DataFrame:
+    """(season, week, team) -> the expected starter's rating (qb_epa,
+    qb_cpoe) and its gap to the passers behind the team's trailing
+    offense stats (qb_*_delta: ~0 most weeks, large when a backup or a
+    returning starter takes over)."""
+    games = qb_game_table()
+    starters = expected_starters(games, extra_outs)
+    rated = qb_ratings(games, starters)
+    inc = incumbent_ratings(games, starters.select("season", "week", "team"))
+    return (
+        rated.join(inc, on=["season", "week", "team"], how="left")
+        .with_columns(
+            (pl.col("qb_epa") - pl.col("inc_epa")).fill_null(0.0).alias("qb_epa_delta"),
+            (pl.col("qb_cpoe") - pl.col("inc_cpoe")).fill_null(0.0).alias("qb_cpoe_delta"),
+        )
+        .select("season", "week", "team", *QB_SKILL_COLS)
     )
 
 
@@ -345,6 +415,7 @@ def build_offense_features(skeleton: pl.DataFrame | None = None,
         .join(vac_pos.rename({"position_out": "position"}),
               on=["season", "week", "team", "position"], how="left")
         .join(vac_team, on=["season", "week", "team"], how="left")
+        .join(qb_skill_table(extra_outs), on=["season", "week", "team"], how="left")
         .with_columns(
             (pl.col("season") == pl.col("rookie_season")).cast(pl.Int8)
             .fill_null(0).alias("is_rookie"),

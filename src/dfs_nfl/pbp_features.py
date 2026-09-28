@@ -218,3 +218,124 @@ def team_context_tables() -> tuple[pl.DataFrame, pl.DataFrame]:
     off, dfn = team_game_tables()
     return (team_trailing(off, TEAM_OFF_COLS, prefix="team_"),
             team_trailing(dfn, TEAM_DEF_COLS, prefix="team_"))
+
+
+# --- QB skill ---------------------------------------------------------------
+# A passer's efficiency — EPA per dropback and CPOE, the standard public
+# QB-quality pair — as of each week, from his own dropbacks before it.
+# Team context (team_off_epa_ewma etc.) is the team's trailing offense, i.e.
+# whoever played QB lately; this rates the QB expected to play *this* week,
+# so a backup forced into the lineup moves every teammate.
+#
+# Games decay by schedule time (half-life QB_HALFLIFE in week-index units,
+# 25 per season, so ~one season incl. the offseason) and the rate is
+# shrunk toward replacement level with K pseudo-dropbacks / -attempts:
+# a spot starter with 60 career dropbacks sits near the backup mean.
+QB_HALFLIFE = 25.0
+QB_K_EPA = 300.0
+QB_K_CPOE = 150.0
+QB_REPLACEMENT_DB = 200     # QB-seasons under this many dropbacks define the prior
+QB_PRIOR_THROUGH = 2023     # prior from seasons <= this (before the eval seasons)
+QB_SKILL_COLS = ["qb_epa", "qb_cpoe", "qb_epa_delta", "qb_cpoe_delta"]
+_IDX_BASE = 2010
+
+
+def _week_idx() -> pl.Expr:
+    return ((pl.col("season") - _IDX_BASE) * 25 + pl.col("week")).cast(pl.Float64)
+
+
+def qb_game_table(pbp: pl.DataFrame | None = None) -> pl.DataFrame:
+    """Per (season, week, team, qb_id): dropbacks, EPA sum, and CPOE sum
+    over attempts with a CPOE. Scrambles carry the QB as rusher, not
+    passer, so the passer id falls back to the rusher on dropbacks."""
+    pbp = read_pbp() if pbp is None else pbp
+    db = pbp.filter(
+        (pl.col("qb_dropback") == 1)
+        & (pl.col("qb_kneel").fill_null(0) == 0)
+        & (pl.col("qb_spike").fill_null(0) == 0)
+        & pl.col("posteam").is_not_null() & pl.col("epa").is_not_null()
+    ).with_columns(
+        pl.coalesce("passer_player_id", "rusher_player_id").alias("qb_id")
+    ).filter(pl.col("qb_id").is_not_null())
+    return db.group_by(["season", "week", pl.col("posteam").alias("team"), "qb_id"]).agg(
+        pl.len().cast(pl.Float64).alias("db"),
+        pl.col("epa").sum().alias("epa_sum"),
+        pl.col("cpoe").is_not_null().sum().cast(pl.Float64).alias("cpoe_n"),
+        pl.col("cpoe").sum().alias("cpoe_sum"),
+    ).with_columns(pl.col("season").cast(pl.Int32), pl.col("week").cast(pl.Int32))
+
+
+def qb_prior(games: pl.DataFrame) -> tuple[float, float]:
+    """(EPA/dropback, CPOE) of low-volume QB-seasons: replacement level."""
+    low = (games.filter(pl.col("season") <= QB_PRIOR_THROUGH)
+           .group_by("season", "qb_id")
+           .agg(pl.col("db", "epa_sum", "cpoe_n", "cpoe_sum").sum())
+           .filter(pl.col("db") < QB_REPLACEMENT_DB))
+    return (float(low["epa_sum"].sum() / low["db"].sum()),
+            float(low["cpoe_sum"].sum() / low["cpoe_n"].sum()))
+
+
+def qb_ratings(games: pl.DataFrame, requests: pl.DataFrame) -> pl.DataFrame:
+    """Shrunk, time-decayed rating of each requested (season, week, qb_id)
+    from that QB's games strictly before the week. Adds qb_epa, qb_cpoe
+    and qb_db (decayed dropback sample) to `requests`."""
+    prior_epa, prior_cpoe = qb_prior(games)
+    h = QB_HALFLIFE
+    per_qb = (
+        games.group_by("season", "week", "qb_id")
+        .agg(pl.col("db", "epa_sum", "cpoe_n", "cpoe_sum").sum())
+        .with_columns(_week_idx().alias("idx"))
+        .sort("qb_id", "idx")
+        .with_columns([
+            (pl.col(c) * (2.0 ** (pl.col("idx") / h))).cum_sum().over("qb_id").alias(f"c_{c}")
+            for c in ["db", "epa_sum", "cpoe_n", "cpoe_sum"]
+        ])
+        .select("qb_id", "idx", "c_db", "c_epa_sum", "c_cpoe_n", "c_cpoe_sum")
+        .sort("idx")
+    )
+    req = (requests.with_columns((_week_idx() - 0.5).alias("idx_lookup"))
+           .sort("idx_lookup"))
+    joined = req.join_asof(per_qb, left_on="idx_lookup", right_on="idx",
+                           by="qb_id", strategy="backward")
+    decay = 2.0 ** (-(pl.col("idx_lookup") + 0.5) / h)
+    s = {c: (pl.col(f"c_{c}").fill_null(0.0) * decay)
+         for c in ["db", "epa_sum", "cpoe_n", "cpoe_sum"]}
+    return joined.with_columns(
+        ((s["epa_sum"] + QB_K_EPA * prior_epa) / (s["db"] + QB_K_EPA)).alias("qb_epa"),
+        ((s["cpoe_sum"] + QB_K_CPOE * prior_cpoe) / (s["cpoe_n"] + QB_K_CPOE)).alias("qb_cpoe"),
+        s["db"].alias("qb_db"),
+    ).drop("idx_lookup", "idx", "c_db", "c_epa_sum", "c_cpoe_n", "c_cpoe_sum")
+
+
+def primary_passers(games: pl.DataFrame) -> pl.DataFrame:
+    """(season, week, team, qb_id): who took the most dropbacks."""
+    return (games.sort("db", descending=True)
+            .unique(subset=["season", "week", "team"], keep="first", maintain_order=True)
+            .select("season", "week", "team", "qb_id"))
+
+
+def incumbent_ratings(games: pl.DataFrame, grid: pl.DataFrame,
+                      n_games: int = 4) -> pl.DataFrame:
+    """Per (season, week, team) in `grid`: dropback-weighted as-of rating
+    of the passers in the team's last n_games — the QB(s) behind the
+    team's trailing offense features. Columns inc_epa, inc_cpoe."""
+    team_games = (games.select("season", "week", "team").unique()
+                  .with_columns(_week_idx().alias("g_idx")))
+    # each grid week -> the team's last n_games games before it
+    recent = (
+        grid.with_columns(_week_idx().alias("t_idx"))
+        .join(team_games.select("team", "g_idx"), on="team")
+        .filter(pl.col("g_idx") < pl.col("t_idx"))
+        .with_columns(pl.col("g_idx").rank("ordinal", descending=True)
+                      .over("season", "week", "team").alias("r"))
+        .filter(pl.col("r") <= n_games)
+    )
+    passers = recent.join(
+        games.with_columns(_week_idx().alias("g_idx")).select("team", "g_idx", "qb_id", "db"),
+        on=["team", "g_idx"],
+    ).group_by("season", "week", "team", "qb_id").agg(pl.col("db").sum())
+    rated = qb_ratings(games, passers.select("season", "week", "qb_id").unique())
+    return (passers.join(rated, on=["season", "week", "qb_id"])
+            .group_by("season", "week", "team")
+            .agg(((pl.col("qb_epa") * pl.col("db")).sum() / pl.col("db").sum()).alias("inc_epa"),
+                 ((pl.col("qb_cpoe") * pl.col("db")).sum() / pl.col("db").sum()).alias("inc_cpoe")))

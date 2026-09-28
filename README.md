@@ -160,6 +160,21 @@ whole difference. The starter-only row is recomputed from
 `outputs/model_predictions.parquet`; `model_backtest.csv` picks it up on
 the next `dfs_nfl.models` run.
 
+**Starting-QB skill (built, not shipped).** The feature store carries
+`qb_epa` / `qb_cpoe` — the expected starter's EPA per dropback and CPOE
+from his own prior dropbacks, time-decayed (about a one-season
+half-life) and shrunk toward backup level (300 / 150 pseudo-plays) —
+and `qb_*_delta`, his gap to the passers behind the team's trailing
+offense stats. The expected starter is the best-ranked depth-chart QB
+not ruled Doubtful/Out (86–94% match the actual primary passer). Team
+context alone can't see a QB change; these can. The 2024–25
+walk-forward A/B (`dfs_nfl.experiments huber huber_qb`) was a wash:
+MAE a hair better at every position (QB −0.037, RB −0.011, WR −0.002,
+TE −0.004), top-5 hit a hair worse (WR −0.022, TE −0.017), every 90%
+week-bootstrap interval spanning zero. WR/TE in weeks with a clear QB
+downgrade did improve (3.30 → 3.23 MAE, n=369), but those are ~11% of
+team-weeks. So `models.feature_columns` leaves them out for now.
+
 The same study found no betting edge in the lines themselves: overs hit
 49%, no spread segment reached the 52.4% needed at −110, and the
 apparent primetime/high-wind unders flip season to season.

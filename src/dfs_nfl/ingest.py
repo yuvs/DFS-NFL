@@ -33,7 +33,7 @@ PBP_COLS = [
     "pass", "rush", "qb_dropback", "qb_kneel", "qb_spike", "sack",
     "pass_attempt", "rush_attempt", "complete_pass", "interception",
     "fumble_lost", "two_point_attempt", "pass_touchdown", "rush_touchdown",
-    "air_yards", "yards_gained", "epa", "success", "xpass", "pass_oe",
+    "air_yards", "yards_gained", "epa", "success", "xpass", "pass_oe", "cpoe",
     # who
     "passer_player_id", "rusher_player_id", "receiver_player_id",
     "td_player_id",
