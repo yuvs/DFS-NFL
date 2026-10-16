@@ -22,7 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 CURATED_DIR = REPO_ROOT / "data" / "curated"
 OUTPUTS_DIR = REPO_ROOT / "outputs"
 
-EVAL_SEASONS = range(2021, 2026)
+EVAL_SEASONS = range(2021, 2027)
 MIN_PRIOR_GAMES = 2
 EWMA_HALFLIFE = 4.0
 SHRINK = 0.5           # weight on (raw factor - 1)

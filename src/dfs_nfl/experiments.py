@@ -34,6 +34,7 @@ from dfs_nfl.models import (  # noqa: F401 - re-exported for tests/callers
     BLEND_WEIGHT,
     EARLY_MAX_ROUNDS,
     EVAL_SEASONS,
+    HOLDOUT_SEASONS,
     HUBER_DELTA,
     TWEEDIE_POWER,
     POSITIONS,
@@ -42,8 +43,15 @@ from dfs_nfl.models import (  # noqa: F401 - re-exported for tests/callers
     feature_columns,
     load_features,
     sample_weights,
+    split_week,
     variant_params,
+    walk_forward_weeks,
 )
+
+# Each variant is scored on both windows: the 2024-25 primary that picks
+# the production spec, and the in-season holdout as a current-environment
+# sanity read (too few weeks to decide anything on its own).
+WINDOWS = {"eval": EVAL_SEASONS, "holdout": HOLDOUT_SEASONS}
 from dfs_nfl.pbp_features import QB_SKILL_COLS
 
 VARIANTS: dict[str, dict] = {
@@ -66,49 +74,43 @@ VARIANTS: dict[str, dict] = {
 def backtest_variant(name: str, spec: dict, baselines: pl.DataFrame) -> list[dict]:
     rows = []
     for pos in POSITIONS:
-        t0 = time.time()
         df = (
             load_features(pos)
             .join(baselines, on=["player_id", "game_id"], how="left")
             .sort(["season", "week", "game_id", "player_id"])
         )
         cols = feature_columns(df) + spec.get("extra_features", [])
-        trainer = Trainer(pos, spec)
-        eval_weeks = (
-            df.filter(pl.col("season").is_in(EVAL_SEASONS))
-            .select("season", "week").unique().sort(["season", "week"]).rows()
-        )
-        preds = []
-        for season, week in eval_weeks:
-            train = df.filter(
-                (pl.col("season") < season)
-                | ((pl.col("season") == season) & (pl.col("week") < week))
-            )
-            test = df.filter(
-                (pl.col("season") == season) & (pl.col("week") == week)
-                & (pl.col("prior_games") >= MIN_PRIOR_GAMES)
-            )
-            if not test.height:
+        for window, seasons in WINDOWS.items():
+            t0 = time.time()
+            trainer = Trainer(pos, spec)
+            preds = []
+            for season, week in walk_forward_weeks(df, seasons):
+                train, test = split_week(df, season, week, MIN_PRIOR_GAMES)
+                if not test.height:
+                    continue
+                yhat = trainer.fit_predict(train, test, cols, season)
+                preds.append(test.select(
+                    "player_id", "game_id", "season", "week", "position", "fd_points",
+                    "pred_b1", "pred_b2",
+                ).with_columns(pl.Series("pred_model", yhat)))
+            if not preds:
                 continue
-            yhat = trainer.fit_predict(train, test, cols, season)
-            preds.append(test.select(
-                "player_id", "game_id", "season", "week", "position", "fd_points",
-                "pred_b1", "pred_b2",
-            ).with_columns(pl.Series("pred_model", yhat)))
-        matched = pl.concat(preds).filter(
-            pl.col("pred_b1").is_not_null() & pl.col("pred_b2").is_not_null()
-        ).with_columns(
-            (BLEND_WEIGHT * pl.col("pred_model")
-             + (1 - BLEND_WEIGHT) * pl.col("pred_b2")).alias("pred_final")
-        )
-        row = {"variant": name, "position": pos} | evaluate(matched)
-        row["rounds"] = round(float(np.mean(trainer.rounds_used)), 0)
-        row["secs"] = round(time.time() - t0, 0)
-        rows.append(row)
-        print(f"  {name:>20} {pos:<3} model MAE {row['model_mae']:.3f} "
-              f"sp {row['model_spearman']:.3f} | final MAE {row['final_mae']:.3f} "
-              f"sp {row['final_spearman']:.3f} | rounds {row['rounds']:.0f} "
-              f"({row['secs']:.0f}s)", flush=True)
+            matched = pl.concat(preds).filter(
+                pl.col("pred_b1").is_not_null() & pl.col("pred_b2").is_not_null()
+            ).with_columns(
+                (BLEND_WEIGHT * pl.col("pred_model")
+                 + (1 - BLEND_WEIGHT) * pl.col("pred_b2")).alias("pred_final")
+            )
+            row = ({"variant": name, "window": window, "position": pos}
+                   | evaluate(matched))
+            row["rounds"] = round(float(np.mean(trainer.rounds_used)), 0)
+            row["secs"] = round(time.time() - t0, 0)
+            rows.append(row)
+            print(f"  {name:>20} {window:>7} {pos:<3} "
+                  f"model MAE {row['model_mae']:.3f} "
+                  f"sp {row['model_spearman']:.3f} | final MAE {row['final_mae']:.3f} "
+                  f"sp {row['final_spearman']:.3f} | rounds {row['rounds']:.0f} "
+                  f"({row['secs']:.0f}s)", flush=True)
     return rows
 
 
@@ -125,12 +127,20 @@ def main() -> None:
     if out.exists() and sys.argv[1:]:
         # partial run: merge over any earlier rows for the same variants
         old = pl.read_csv(out).filter(~pl.col("variant").is_in(names))
+        if "window" not in old.columns:
+            # pre-holdout rows were scored on EVAL_SEASONS only
+            old = old.with_columns(pl.lit("eval").alias("window"))
         report = pl.concat([old, report], how="diagonal_relaxed")
     report.write_csv(out)
     keep = ["variant", "position", "model_mae", "model_spearman",
             "final_mae", "final_rmse", "final_spearman", "rounds"]
     with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=200):
-        print(report.select(keep).sort(["position", "final_mae"]))
+        for window in WINDOWS:
+            sub = report.filter(pl.col("window") == window)
+            if not sub.height:
+                continue
+            print(f"\n=== {window} ({WINDOWS[window]}) ===")
+            print(sub.select(keep).sort(["position", "final_mae"]))
 
 
 if __name__ == "__main__":

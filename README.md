@@ -14,6 +14,7 @@ uv run python -m dfs_nfl.baselines   # walk-forward baseline backtest
 uv run python -m dfs_nfl.features    # build feature store
 uv run python -m dfs_nfl.models      # walk-forward LightGBM backtest
 uv run python -m dfs_nfl.quantiles   # p10/p50/p90 floor-ceiling backtest
+uv run python -m dfs_nfl.quantiles calibrate   # sweep the p10 training alphas
 uv run python -m dfs_nfl.coldstart   # <2-game player prior backtest
 uv run python -m dfs_nfl.odds 2026 1     # current-week Vegas lines
 uv run python -m dfs_nfl.weather 2026 1  # kickoff weather forecasts
@@ -49,6 +50,16 @@ per player/DST. Columns:
 
 Optimizing for upside: sort by `p90` (or filter high `cv` + positive
 `skew`). Optimizing for stability: maximize `p10`, prefer low `cv`.
+
+One caveat on `p10` at RB/WR/TE: 12% / 23% / 24% of actual scores are
+*exactly* zero, so the real 10th percentile of those distributions is
+0.0 and the floor is compressed against it (mean p10 ≈ 0.5–1.5 points).
+It still ranks players usefully among the ones you'd roster — within
+the projection ≥ 6 pool it spreads 0.6–2.1 points and tracks projection
+at ρ 0.64–0.92 — but its *coverage* is not a calibration signal there,
+and `dfs_nfl.quantiles` prints `pct_zero` next to `cov_p10` to say so.
+QB is the only position with a continuous 10th percentile.
+
 Scorecards append to `outputs/accuracy_log.csv`: per-position MAE,
 RMSE, within-week Spearman, p10/p90 coverage, and `top5_hit` — the share
 of the projected top 5 that finished in the actual top 10, the DFS
@@ -179,6 +190,25 @@ The same study found no betting edge in the lines themselves: overs hit
 49%, no spread segment reached the 52.4% needed at −110, and the
 apparent primetime/high-wind unders flip season to season.
 
+### Evaluation windows: eval vs holdout
+
+Every backtest here scores two windows, reported side by side and never
+pooled:
+
+- **eval** — `models.EVAL_SEASONS` (2024–25), the ~39-week primary that
+  picks the production spec and every tuned constant.
+- **holdout** — `models.HOLDOUT_SEASONS` (2026), the current season's
+  completed weeks. Far too thin to decide anything by itself, but it's
+  the only out-of-sample read on the live scoring environment, and
+  everything on record above was chosen without one.
+
+`dfs_nfl.experiments` writes a `window` column per variant/position;
+`dfs_nfl.quantiles` reports coverage per window. The holdout reads off
+the curated feature store and `baseline_predictions.parquet`, which
+production never touches (it builds features on the fly), so
+`dfs_nfl.weekly` rebuilds both every run — otherwise the holdout
+silently stops short of the completed weeks.
+
 ## Salary value sheets
 
 Drop FanDuel "players list" CSV exports (lobby → download players list)
@@ -304,8 +334,8 @@ overrides via `dfs_nfl.odds`; without it, nflverse schedule lines are used.
 - `src/dfs_nfl/models.py` — per-position LightGBM (with stacked baselines
   as features) blended 80/20 with baseline B2, then anchored to Vegas
   team totals
-- `src/dfs_nfl/quantiles.py` — p10/p50/p90 quantile models (calibrated
-  within ~0.02 of target coverage on 2024–25)
+- `src/dfs_nfl/quantiles.py` — p10/p50/p90 quantile models and the
+  `calibrate` pass that fits their training alphas to target coverage
 - `src/dfs_nfl/coldstart.py` — prior model for players with <2 career
   games (depth chart, draft capital, Vegas); beats naive position mean
   by ~0.8–0.9 MAE

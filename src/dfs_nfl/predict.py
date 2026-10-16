@@ -265,9 +265,7 @@ def _train_and_predict(df: pl.DataFrame, pos: str, season: int, week: int) -> pl
     qparams = params | {"objective": "quantile"}
     qhat = np.sort(np.column_stack([
         lgb.train(
-            qparams | {"alpha": quantiles.TRAIN_ALPHA_P10_QB
-                       if (a == 0.1 and pos == "QB")
-                       else quantiles.TRAIN_ALPHA[a]},
+            qparams | {"alpha": quantiles.train_alpha(pos, a)},
             lgb.Dataset(x_train, label=y_train),
             num_boost_round=quantiles.NUM_ROUNDS,
         ).predict(x_test)

@@ -193,6 +193,27 @@ def build_slate_outputs(season: int, week: int) -> None:
                 print(f"  wrote {stem}.csv and {stem}_upload.csv")
 
 
+def refresh_backtest_inputs() -> None:
+    """Rebuild the baseline predictions and the curated feature store.
+
+    Production projects from features built on the fly, so these two
+    files only feed the backtest harnesses (models / experiments /
+    quantiles / coldstart) — which means they used to sit at whatever
+    week they were last built by hand, and the in-season holdout read
+    off them was silently short of the completed weeks. Both rebuilds
+    are a couple of seconds, so the weekly run just redoes them.
+    """
+    from dfs_nfl.baselines import main as build_baselines
+    from dfs_nfl.features import main as build_features
+
+    for label, fn in (("baselines", build_baselines), ("features", build_features)):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001 - never block the week's lineups
+            print(f"  {label} rebuild failed ({type(e).__name__}: {e}); "
+                  "backtest inputs left as they were")
+
+
 def main() -> None:
     # schedules first, so next_week() sees the freshest results/season
     from dfs_nfl.ingest import ingest_schedules
@@ -201,6 +222,9 @@ def main() -> None:
     season, week = next_week()
     print(f"current target: {season} week {week}")
     refresh_data(season)
+
+    print("rebuilding backtest inputs (baselines + feature store)...")
+    refresh_backtest_inputs()
 
     prior = PROJECTIONS_DIR / f"{season}_w{week - 1:02d}.parquet"
     if week > 1 and prior.exists():

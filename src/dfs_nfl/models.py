@@ -19,6 +19,13 @@ from scipy.stats import spearmanr
 from dfs_nfl.baselines import CURATED_DIR, OUTPUTS_DIR, MIN_PRIOR_GAMES
 
 EVAL_SEASONS = [2024, 2025]
+# In-season holdout, scored and reported beside EVAL_SEASONS rather than
+# merged into it: a part-season is far too thin to lead a leaderboard,
+# but it's the only out-of-sample read on the current scoring
+# environment, and every variant on record was chosen without one.
+# Depends on the curated feature store and baseline_predictions covering
+# the season's completed weeks — dfs_nfl.weekly refreshes both.
+HOLDOUT_SEASONS = [2026]
 POSITIONS = ["QB", "RB", "WR", "TE", "DST"]
 
 ID_COLS = {
@@ -198,6 +205,28 @@ def to_matrix(df: pl.DataFrame, cols: list[str]) -> np.ndarray:
     return df.select([pl.col(c).cast(pl.Float64) for c in cols]).to_numpy()
 
 
+def walk_forward_weeks(df: pl.DataFrame, seasons: list[int]) -> list[tuple[int, int]]:
+    """(season, week) pairs to score, oldest first — the outer loop of
+    every walk-forward backtest here."""
+    return (df.filter(pl.col("season").is_in(seasons))
+            .select("season", "week").unique().sort(["season", "week"]).rows())
+
+
+def split_week(df: pl.DataFrame, season: int, week: int,
+               min_prior: int = MIN_PRIOR_GAMES) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Train on everything strictly before (season, week); test on that
+    week's players with enough history to be scored."""
+    train = df.filter(
+        (pl.col("season") < season)
+        | ((pl.col("season") == season) & (pl.col("week") < week))
+    )
+    test = df.filter(
+        (pl.col("season") == season) & (pl.col("week") == week)
+        & (pl.col("prior_games") >= min_prior)
+    )
+    return train, test
+
+
 HUBER_DELTA = 4.0            # roughly one MAE: quadratic inside, linear beyond
 TWEEDIE_POWER = 1.3
 EARLY_MAX_ROUNDS = 1500
@@ -304,20 +333,9 @@ def backtest_position(pos: str, baselines: pl.DataFrame) -> tuple[pl.DataFrame, 
     )
     cols = feature_columns(df)
     trainer = Trainer(pos, model_spec(pos))
-    eval_weeks = (
-        df.filter(pl.col("season").is_in(EVAL_SEASONS))
-        .select("season", "week").unique().sort(["season", "week"]).rows()
-    )
     preds, importances = [], np.zeros(len(cols))
-    for season, week in eval_weeks:
-        train = df.filter(
-            (pl.col("season") < season)
-            | ((pl.col("season") == season) & (pl.col("week") < week))
-        )
-        test = df.filter(
-            (pl.col("season") == season) & (pl.col("week") == week)
-            & (pl.col("prior_games") >= MIN_PRIOR_GAMES)
-        )
+    for season, week in walk_forward_weeks(df, EVAL_SEASONS):
+        train, test = split_week(df, season, week)
         if not test.height:
             continue
         yhat = trainer.fit_predict(train, test, cols, season)
