@@ -269,7 +269,10 @@ Each run writes two files per mode to `outputs/lineups/`:
 builds get a `_tournament_{TEAM-TEAM}` suffix (e.g.
 `2026_w02_gpp_tournament_LA-NYG.csv`) and the
 `MVP - 1.5X Points,AnyFLEX,...` header, so a Thursday and a Monday
-build in the same week coexist. On the contest entry screen choose
+build in the same week coexist. A classic slate whose first game isn't
+on Sunday (Thanksgiving, a Thursday-Monday short slate) gets the kickoff
+weekday instead (`2026_w12_cash_thu.csv`), so the Sunday main-slate
+build doesn't overwrite it. On the contest entry screen choose
 "Upload lineups from CSV" and hand it the upload file. IDs are
 slate-specific, so regenerate after downloading a new players list.
 
@@ -282,11 +285,13 @@ overwrite Thursday's lineups (the ones you entered, which the lineup
 scorecard grades). The only manual step each week is downloading those
 CSVs from the FanDuel lobby.
 
-Single-game slates are **re-projected at slate time**: the injury report
+Single-game slates, and classic slates that kick off before Sunday (their
+main projections are Tuesday's, from before that week's injury reports),
+are **re-projected at slate time**: the injury report
 and depth chart are refreshed, the slate's own O/IR/D/NA tags are
 applied as "Out" (FanDuel's game-day inactive tag is the only pre-kickoff
 record of a Monday-night scratch; nflverse's report stops at Friday), and
-just the two teams are projected into
+just the slate's teams are projected into
 `outputs/projections/{season}_w{week:02d}_slate{id}.csv`. The week's
 main projection file is untouched, so the scorecard keeps grading the
 Sunday-morning call. With Nacua tagged inactive for the week 2 Monday

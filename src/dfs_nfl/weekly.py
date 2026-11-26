@@ -81,6 +81,21 @@ def slate_first_kickoff(season: int, week: int, teams: list[str]) -> datetime | 
     )
 
 
+def off_day_suffix(season: int, week: int, teams: list[str]) -> str:
+    """'' for a slate whose first kickoff falls on Sunday (the main slate),
+    else '_' + the kickoff weekday ('_thu' for Thanksgiving or a Thursday
+    short slate). A week can carry more than one classic slate; without
+    this, Sunday's build writes {season}_w{week}_cash.csv over Thursday's
+    lineups before the scorecard grades them."""
+    try:
+        kickoff = slate_first_kickoff(season, week, teams)
+    except Exception:  # noqa: BLE001 - no schedule: keep the plain name
+        return ""
+    if kickoff is None or kickoff.weekday() == 6:
+        return ""
+    return "_" + kickoff.strftime("%a").lower()
+
+
 def slate_started(season: int, week: int, teams: list[str],
                   now: datetime | None = None) -> bool:
     """True once the slate's first game has kicked off. Lineups for it
@@ -173,7 +188,10 @@ def build_slate_outputs(season: int, week: int) -> None:
             continue
         print(f"{slate.name}: {fmt} slate")
         proj = None
-        if fmt == "tournament":
+        # the main projections are from the last weekly run (Tuesday for a
+        # Thursday slate, before that week's injury reports): re-project
+        # anything that isn't the Sunday-morning main slate
+        if fmt == "tournament" or off_day_suffix(season, week, teams):
             proj = reproject_slate(season, week, slate, raw)
         sheet = build_value_sheet(season, week, slate, projections_path=proj)
         sheet_path = value_sheet_path(season, week, slate)

@@ -60,3 +60,11 @@ def test_unknown_teams_are_never_skipped(tmp_path, monkeypatch):
     assert weekly.slate_first_kickoff(2026, 3, ["XXX"]) is None
     assert not weekly.slate_started(2026, 3, ["XXX"],
                                     now=datetime(2027, 1, 1, tzinfo=weekly.KICKOFF_TZ))
+
+
+def test_off_day_suffix_names_non_sunday_slates(tmp_path, monkeypatch):
+    weekly = _schedule(tmp_path, monkeypatch)
+    # Thursday slate gets the weekday; the Sunday main slate keeps the plain name
+    assert weekly.off_day_suffix(2026, 3, ["ATL", "GB"]) == "_thu"
+    assert weekly.off_day_suffix(2026, 3, ["BAL", "DAL", "DET", "KC"]) == ""
+    assert weekly.off_day_suffix(2026, 3, ["XXX"]) == ""

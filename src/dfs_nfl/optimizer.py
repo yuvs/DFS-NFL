@@ -408,10 +408,17 @@ def upload_row(lineup: pl.DataFrame) -> list[str]:
 def lineup_stem(lineups: list[pl.DataFrame], season: int, week: int,
                 mode: str) -> Path:
     """Output path stem: {season}_w{week}_{mode} for classic, plus
-    _tournament_{TEAM-TEAM} (alphabetical) for single-game builds."""
+    _tournament_{TEAM-TEAM} (alphabetical) for single-game builds. A
+    classic slate that kicks off on a day other than Sunday (Thanksgiving,
+    a Thursday-Monday short slate) gets the weekday too, e.g.
+    2026_w12_cash_thu, so the Sunday main-slate build doesn't overwrite it."""
     stem = f"{season}_w{week:02d}_{mode}"
     if lineups and "is_mvp" in lineups[0].columns:
         stem += "_tournament_" + "-".join(sorted(set(lineups[0]["team"])))
+    elif lineups:
+        from dfs_nfl.weekly import off_day_suffix
+
+        stem += off_day_suffix(season, week, sorted(set(lineups[0]["team"])))
     return LINEUPS_DIR / stem
 
 
